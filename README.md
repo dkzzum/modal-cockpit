@@ -8,6 +8,10 @@ It uses Modal's native multi-profile configuration and adds one-command switchin
 
 > **Scope:** `modal-cockpit` manages Modal CLI/API credentials in `~/.modal.toml`. It does **not** manage browser cookies or dashboard sessions for modal.com.
 
+## Instructions for coding agents
+
+See [AGENTS.md](AGENTS.md) for copy-pasteable instructions that tell coding agents to run account-bound Modal commands through `modal-cockpit exec` instead of bare `modal`, avoid manual credential handling, and follow strict safety rules for volume transfer. Copy that file into repositories where agents should use Modal through `modal-cockpit`, or merge the relevant sections into an existing `AGENTS.md`.
+
 ## Why not just `modal profile activate`?
 
 Modal already supports multiple profiles in one TOML file. `modal-cockpit` keeps that native model instead of replacing it, and adds the missing operational safety layer:

@@ -6,6 +6,10 @@
 
 English documentation: [README.md](README.md).
 
+## Инструкция для coding agents
+
+В [AGENTS.md](AGENTS.md) лежит готовая инструкция для агентов: запускать аккаунтные команды Modal через `modal-cockpit exec` вместо bare `modal`, не управлять секретами вручную и соблюдать строгие правила безопасности при переносе volumes. Скопируйте этот файл в репозитории, где агенты должны работать с Modal через `modal-cockpit`, или перенесите нужные разделы в существующий `AGENTS.md` такого репозитория.
+
 ## Почему не просто `modal profile activate`
 
 У Modal уже есть штатные профили и команда `modal profile activate`. `modal-cockpit` не заменяет эту модель, а делает её безопаснее и удобнее:
