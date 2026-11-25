@@ -25,3 +25,9 @@ software running as the same OS user: the local encryption key is stored under
 The tool is designed to avoid printing secrets, use restrictive permissions,
 serialize writes, create encrypted backups, and write configuration files
 atomically.
+
+Volume transfer writes copied data to a temporary plaintext local staging
+directory. The directory is removed after a normal exit, but plaintext remnants
+can remain after SIGKILL, power loss or forced termination. Choose `--staging-dir`
+carefully and remove stale `volume-transfer-*`/`volume-verify-*` directories if
+a transfer is interrupted.

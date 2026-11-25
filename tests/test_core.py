@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import stat
 import subprocess
@@ -10,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from modal_cockpit.core import ModalCockpit
-from modal_cockpit.errors import ConfigError, ExternalCommandError
+from modal_cockpit.errors import CockpitError, ConfigError, ExternalCommandError
 
 from .conftest import read_toml
 
@@ -418,3 +419,288 @@ def test_capture_honors_modal_profile_override(cockpit, monkeypatch):
 
     assert meta["modal_profile"] == "gamma"
     assert cockpit.store.load_account("captured")["section"]["token_id"] == "ak-gamma"
+
+
+def install_fake_volume_modal(tmp_path: Path, monkeypatch, state: dict) -> Path:
+    bin_dir = tmp_path / "fake-bin"
+    bin_dir.mkdir()
+    state_path = tmp_path / "fake-modal-state.json"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    fake_modal = bin_dir / "modal"
+    fake_modal.write_text(
+        textwrap.dedent(
+            '''\
+            #!/usr/bin/env python3
+            import json
+            import os
+            import sys
+            from pathlib import Path, PurePosixPath
+
+            state_file = Path(os.environ["FAKE_MODAL_STATE"])
+            state = json.loads(state_file.read_text(encoding="utf-8"))
+            profile = os.environ["MODAL_PROFILE"]
+            account = state.setdefault("profiles", {}).setdefault(profile, {"volumes": {}})
+            volumes = account.setdefault("volumes", {})
+
+            def clean_options(items):
+                result = []
+                force = False
+                skip = False
+                for index, item in enumerate(items):
+                    if skip:
+                        skip = False
+                        continue
+                    if item == "-e":
+                        skip = True
+                        continue
+                    if item in ("--force", "-f"):
+                        force = True
+                        continue
+                    if item == "--json":
+                        continue
+                    result.append(item)
+                return result, force
+
+            args, force = clean_options(sys.argv[1:])
+            log_path = os.environ.get("FAKE_MODAL_LOG")
+            if log_path:
+                with open(log_path, "a", encoding="utf-8") as log_file:
+                    log_file.write(json.dumps({
+                        "argv": sys.argv[1:],
+                        "profile": profile,
+                        "modal_environment_present": bool(os.environ.get("MODAL_ENVIRONMENT")),
+                        "token_id_present": bool(os.environ.get("MODAL_TOKEN_ID")),
+                        "token_secret_present": bool(os.environ.get("MODAL_TOKEN_SECRET")),
+                    }) + "\\n")
+            if args[:2] == ["volume", "list"]:
+                rows = [
+                    {"name": name, "created_at": "2026-01-01", "created_by": "fake"}
+                    for name in sorted(volumes)
+                ]
+                print(json.dumps(rows))
+                sys.exit(0)
+            if args[:2] == ["volume", "create"]:
+                volumes.setdefault(args[2], {})
+                state_file.write_text(json.dumps(state), encoding="utf-8")
+                sys.exit(0)
+            if args[:2] == ["volume", "ls"]:
+                volume = args[2]
+                if volume not in volumes:
+                    print("missing volume", file=sys.stderr)
+                    sys.exit(2)
+                entries = {}
+                for relative, content in volumes[volume].items():
+                    first, *rest = relative.split("/")
+                    if rest:
+                        entries[first] = {"filename": first, "type": "dir", "created_modified": "x", "size": 0}
+                    else:
+                        entries[first] = {
+                            "filename": first,
+                            "type": "file",
+                            "created_modified": "x",
+                            "size": len(content),
+                        }
+                print(json.dumps(list(entries.values())))
+                sys.exit(0)
+            if args[:2] == ["volume", "get"]:
+                volume, remote_path, destination = args[2:5]
+                if volume not in volumes:
+                    print("missing source volume", file=sys.stderr)
+                    sys.exit(2)
+                if remote_path != "/":
+                    print("fake modal supports only root transfer", file=sys.stderr)
+                    sys.exit(2)
+                root = Path(destination)
+                root.mkdir(parents=True, exist_ok=True)
+                for relative, content in volumes[volume].items():
+                    target = root / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(content, encoding="utf-8")
+                sys.exit(0)
+            if args[:2] == ["volume", "put"]:
+                volume, local_path, remote_path = args[2:5]
+                if volume not in volumes:
+                    print("missing destination volume", file=sys.stderr)
+                    sys.exit(2)
+                root = Path(local_path)
+                updates = {}
+                for source in root.rglob("*"):
+                    if not source.is_file():
+                        continue
+                    relative = source.relative_to(root).as_posix()
+                    if remote_path in ("/", "/."):
+                        target = relative
+                    else:
+                        target = (PurePosixPath(remote_path) / relative).as_posix().lstrip("/")
+                    updates[target] = source.read_text(encoding="utf-8")
+                if not force:
+                    collisions = sorted(set(updates) & set(volumes[volume]))
+                    if collisions:
+                        print("destination files exist", file=sys.stderr)
+                        sys.exit(3)
+                volumes[volume].update(updates)
+                state_file.write_text(json.dumps(state), encoding="utf-8")
+                sys.exit(0)
+            print("unsupported fake modal command: " + " ".join(sys.argv[1:]), file=sys.stderr)
+            sys.exit(2)
+            '''
+        ),
+        encoding="utf-8",
+    )
+    fake_modal.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("FAKE_MODAL_STATE", str(state_path))
+    monkeypatch.setenv("FAKE_MODAL_LOG", str(tmp_path / "fake-modal-log.jsonl"))
+    return state_path
+
+
+def seed_transfer_accounts(cockpit):
+    cockpit.add_token_account("alpha", profile=None, token_id="ak-alpha", token_secret="as-alpha", activate=True)
+    cockpit.add_token_account("beta", profile=None, token_id="ak-beta", token_secret="as-beta")
+
+
+def test_transfer_volume_creates_destination_and_copies_files(cockpit, tmp_path: Path, monkeypatch):
+    seed_transfer_accounts(cockpit)
+    state_path = install_fake_volume_modal(
+        tmp_path,
+        monkeypatch,
+        {"profiles": {"alpha": {"volumes": {"data": {"a.txt": "hello", "dir/b.txt": "world"}}}, "beta": {"volumes": {}}}},
+    )
+
+    result = cockpit.transfer_volume("alpha", "beta", "data")
+
+    assert result["created_volume"] is True
+    assert result["files"] == 2
+    assert result["bytes"] == 10
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["profiles"]["beta"]["volumes"]["data"] == {"a.txt": "hello", "dir/b.txt": "world"}
+    assert not list((cockpit.store.root / "tmp").glob("volume-transfer-*"))
+
+
+def test_transfer_all_volumes_copies_every_source_volume(cockpit, tmp_path: Path, monkeypatch):
+    seed_transfer_accounts(cockpit)
+    state_path = install_fake_volume_modal(
+        tmp_path,
+        monkeypatch,
+        {
+            "profiles": {
+                "alpha": {"volumes": {"one": {"1.txt": "1"}, "two": {"nested/2.txt": "22"}}},
+                "beta": {"volumes": {}},
+            }
+        },
+    )
+
+    results = cockpit.transfer_volumes("alpha", "beta", force=True)
+
+    assert [item["source_volume"] for item in results] == ["one", "two"]
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["profiles"]["beta"]["volumes"]["one"] == {"1.txt": "1"}
+    assert state["profiles"]["beta"]["volumes"]["two"] == {"nested/2.txt": "22"}
+
+
+def test_transfer_volume_collision_requires_force(cockpit, tmp_path: Path, monkeypatch):
+    seed_transfer_accounts(cockpit)
+    install_fake_volume_modal(
+        tmp_path,
+        monkeypatch,
+        {
+            "profiles": {
+                "alpha": {"volumes": {"data": {"a.txt": "new"}}},
+                "beta": {"volumes": {"data": {"a.txt": "old"}}},
+            }
+        },
+    )
+
+    with pytest.raises(CockpitError, match="уже содержит данные"):
+        cockpit.transfer_volume("alpha", "beta", "data")
+
+    result = cockpit.transfer_volume("alpha", "beta", "data", force=True)
+    assert result["created_volume"] is False
+
+
+def test_transfer_volume_rejects_same_source_and_destination(cockpit):
+    seed_transfer_accounts(cockpit)
+    with pytest.raises(CockpitError):
+        cockpit.transfer_volume("alpha", "alpha", "data")
+
+
+def read_fake_modal_log(tmp_path: Path) -> list[dict]:
+    log_path = tmp_path / "fake-modal-log.jsonl"
+    if not log_path.exists():
+        return []
+    return [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_transfer_preflight_prevents_download_to_non_empty_destination(cockpit, tmp_path: Path, monkeypatch):
+    seed_transfer_accounts(cockpit)
+    install_fake_volume_modal(
+        tmp_path,
+        monkeypatch,
+        {
+            "profiles": {
+                "alpha": {"volumes": {"data": {"a.txt": "new"}}},
+                "beta": {"volumes": {"data": {"a.txt": "old"}}},
+            }
+        },
+    )
+
+    with pytest.raises(CockpitError):
+        cockpit.transfer_volume("alpha", "beta", "data")
+
+    commands = [entry["argv"][:2] for entry in read_fake_modal_log(tmp_path)]
+    assert ["volume", "get"] not in commands
+    assert ["volume", "put"] not in commands
+
+
+def test_transfer_force_is_upload_only_and_environment_is_scrubbed(cockpit, tmp_path: Path, monkeypatch):
+    seed_transfer_accounts(cockpit)
+    install_fake_volume_modal(
+        tmp_path,
+        monkeypatch,
+        {"profiles": {"alpha": {"volumes": {"data": {"a.txt": "new"}}}, "beta": {"volumes": {}}}},
+    )
+    monkeypatch.setenv("MODAL_ENVIRONMENT", "wrong-env")
+    monkeypatch.setenv("MODAL_TOKEN_ID", "ak-env")
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", "as-env")
+
+    cockpit.transfer_volume("alpha", "beta", "data", force=True)
+
+    entries = read_fake_modal_log(tmp_path)
+    get_entries = [entry for entry in entries if entry["argv"][:2] == ["volume", "get"]]
+    put_entries = [entry for entry in entries if entry["argv"][:2] == ["volume", "put"]]
+    assert get_entries and "--force" not in get_entries[0]["argv"]
+    assert put_entries and "--force" in put_entries[0]["argv"]
+    assert put_entries[0]["argv"][-1] == "/."
+    assert all(not entry["modal_environment_present"] for entry in entries)
+    assert all(not entry["token_id_present"] for entry in entries)
+    assert all(not entry["token_secret_present"] for entry in entries)
+
+
+def test_staging_tree_rejects_symlink_without_following_it(tmp_path: Path):
+    outside = tmp_path / "outside-secret"
+    outside.write_text("secret", encoding="utf-8")
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    (staging / "link").symlink_to(outside)
+
+    with pytest.raises(CockpitError, match="symlink/special"):
+        ModalCockpit._inspect_staging_tree(staging)
+
+    assert outside.read_text(encoding="utf-8") == "secret"
+
+
+def test_transfer_verify_redownloads_destination_and_compares_hashes(cockpit, tmp_path: Path, monkeypatch):
+    seed_transfer_accounts(cockpit)
+    install_fake_volume_modal(
+        tmp_path,
+        monkeypatch,
+        {"profiles": {"alpha": {"volumes": {"data": {"a.txt": "hello", "dir/b.txt": "world"}}}, "beta": {"volumes": {}}}},
+    )
+
+    result = cockpit.transfer_volume("alpha", "beta", "data", verify=True)
+
+    assert result["verified"] is True
+    entries = read_fake_modal_log(tmp_path)
+    get_entries = [entry for entry in entries if entry["argv"][:2] == ["volume", "get"]]
+    assert len(get_entries) == 2
+    assert [entry["profile"] for entry in get_entries] == ["alpha", "beta"]

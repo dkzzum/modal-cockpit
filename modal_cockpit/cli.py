@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 from . import __version__
@@ -218,6 +219,90 @@ def cmd_env(args: argparse.Namespace) -> int:
     return 0
 
 
+def format_byte_count(value: int) -> str:
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    amount = float(value)
+    for unit in units:
+        if amount < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(amount)} B"
+            return f"{amount:.1f} {unit}"
+        amount /= 1024
+    return f"{value} B"
+
+
+def cmd_transfer(args: argparse.Namespace) -> int:
+    cockpit = build_cockpit(args)
+    if args.all_volumes and args.volume:
+        raise CockpitError("укажите либо конкретный volume, либо --all-volumes")
+    if not args.all_volumes and not args.volume:
+        raise CockpitError("укажите volume или --all-volumes")
+    if args.all_volumes and args.destination_volume:
+        raise CockpitError("--dest-volume можно использовать только при переносе одного volume")
+
+    target = "all volumes" if args.all_volumes else f"volume {args.volume}"
+    action = "copy Modal volume data into another account"
+    if args.force:
+        action += " and overwrite existing destination files"
+    confirm_or_fail(
+        action,
+        args.yes,
+        f"{args.source_account} -> {args.destination_account}, {target}",
+    )
+    staging_parent = Path(args.staging_dir).expanduser() if args.staging_dir else None
+    if args.volume:
+        results = [
+            cockpit.transfer_volume(
+                args.source_account,
+                args.destination_account,
+                args.volume,
+                destination_volume=args.destination_volume,
+                force=args.force,
+                staging_parent=staging_parent,
+                source_environment=args.source_env,
+                destination_environment=args.dest_env,
+                verify=args.verify,
+            )
+        ]
+    else:
+        results = cockpit.transfer_volumes(
+            args.source_account,
+            args.destination_account,
+            force=args.force,
+            staging_parent=staging_parent,
+            source_environment=args.source_env,
+            destination_environment=args.dest_env,
+            verify=args.verify,
+        )
+    total_files = sum(item["files"] for item in results)
+    total_bytes = sum(item["bytes"] for item in results)
+    if args.json:
+        print_json(
+            {
+                "source_account": args.source_account,
+                "destination_account": args.destination_account,
+                "volumes": results,
+                "total_volumes": len(results),
+                "total_files": total_files,
+                "total_bytes": total_bytes,
+            }
+        )
+        return 0
+    if not results:
+        print("no volumes found in source account")
+        return 0
+    for item in results:
+        created = ", created destination volume" if item["created_volume"] else ""
+        verified = ", verified" if item.get("verified") else ""
+        print(
+            f"transferred: {item['source_volume']} -> {item['destination_volume']} "
+            f"({item['files']} files, {format_byte_count(item['bytes'])}{created}{verified})"
+        )
+    print(f"transfer complete: {len(results)} volumes, {total_files} files, {format_byte_count(total_bytes)}")
+    print("source volumes were not modified or deleted")
+    return 0
+
+
 def cmd_backup(args: argparse.Namespace) -> int:
     cockpit = build_cockpit(args)
     backup_id = cockpit.backup_now(reason=args.reason)
@@ -346,6 +431,21 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("alias")
     p.add_argument("--keep-env", action="store_true", help="do not emit unset commands for credential overrides")
     p.set_defaults(func=cmd_env)
+
+    p = sub.add_parser("transfer", help="copy Modal volumes between managed accounts through local staging")
+    p.add_argument("source_account", help="managed source account alias")
+    p.add_argument("destination_account", help="managed destination account alias")
+    p.add_argument("volume", nargs="?", help="volume to copy; omit when using --all-volumes")
+    p.add_argument("--all-volumes", action="store_true", help="copy every volume visible in the source account")
+    p.add_argument("--dest-volume", "--destination-volume", dest="destination_volume", help="destination volume name")
+    p.add_argument("--force", action="store_true", help="overwrite existing destination files")
+    p.add_argument("--yes", action="store_true", help="confirm remote writes without an interactive prompt")
+    p.add_argument("--json", action="store_true", help="print machine-readable transfer summary")
+    p.add_argument("--verify", action="store_true", help="re-download destination and compare SHA-256 for copied files")
+    p.add_argument("--staging-dir", help="directory used as the parent for temporary local transfer data")
+    p.add_argument("--source-env", help="Modal environment in the source account")
+    p.add_argument("--dest-env", "--destination-env", dest="dest_env", help="Modal environment in the destination account")
+    p.set_defaults(func=cmd_transfer)
 
     p = sub.add_parser("backup", help="create an encrypted backup of the whole Modal config")
     p.add_argument("--reason", default="manual", help="backup reason label")

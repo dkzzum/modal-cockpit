@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -361,6 +364,7 @@ class ModalCockpit:
         env = os.environ.copy()
         env["MODAL_PROFILE"] = account["modal_profile"]
         env["MODAL_CONFIG_PATH"] = str(self.config_path)
+        env.pop("MODAL_ENVIRONMENT", None)
         if not keep_credential_env:
             for name in CREDENTIAL_ENV_VARS:
                 env.pop(name, None)
@@ -376,6 +380,338 @@ class ModalCockpit:
         except OSError as exc:
             raise ExternalCommandError(f"не удалось запустить команду {command[0]!r}: {exc}") from exc
         return completed.returncode
+
+    @staticmethod
+    def _redact_modal_output(text: str) -> str:
+        return re.sub(r"\b(?:ak|as)-[A-Za-z0-9_-]+\b", "[redacted]", text)
+
+    @staticmethod
+    def _environment_args(environment: str | None) -> list[str]:
+        return ["-e", environment] if environment else []
+
+    def _run_modal(
+        self,
+        alias: str,
+        args: Sequence[str],
+        *,
+        capture_output: bool = False,
+    ) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
+        self.ensure_profile_present(alias)
+        modal = shutil.which("modal")
+        if modal is None:
+            raise ExternalCommandError("Modal CLI не найден в PATH; установите modal перед transfer")
+        env = self.build_exec_environment(alias)
+        command = [modal, *args]
+        try:
+            if capture_output:
+                completed = subprocess.run(
+                    command,
+                    env=env,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+            else:
+                completed = subprocess.run(command, env=env, check=False)
+        except OSError as exc:
+            raise ExternalCommandError(f"не удалось запустить Modal CLI {modal!r}: {exc}") from exc
+        if completed.returncode != 0:
+            operation = " ".join(args[:2]) or "command"
+            detail = ""
+            if capture_output:
+                combined = self._redact_modal_output((completed.stderr or "") + "\n" + (completed.stdout or "")).strip()
+                if combined:
+                    detail = ": " + combined[-1200:]
+            else:
+                detail = "; вывод команды показан выше"
+            raise ExternalCommandError(
+                f"modal {operation} завершился с кодом {completed.returncode} для аккаунта {alias!r}{detail}"
+            )
+        return completed
+
+    def list_volume_names(self, alias: str, *, environment: str | None = None) -> list[str]:
+        completed = self._run_modal(
+            alias,
+            ["volume", "list", "--json", *self._environment_args(environment)],
+            capture_output=True,
+        )
+        try:
+            rows = json.loads(completed.stdout or "[]")
+        except json.JSONDecodeError as exc:
+            raise ExternalCommandError("modal volume list вернул некорректный JSON") from exc
+        if not isinstance(rows, list):
+            raise ExternalCommandError("modal volume list вернул неожиданный JSON-формат")
+        names: list[str] = []
+        for row in rows:
+            if not isinstance(row, dict) or not isinstance(row.get("name"), str):
+                raise ExternalCommandError("modal volume list вернул неожиданную строку JSON")
+            names.append(row["name"])
+        return sorted(names)
+
+    def list_volume_entries(
+        self,
+        alias: str,
+        volume: str,
+        *,
+        path: str = "/",
+        environment: str | None = None,
+    ) -> list[dict[str, Any]]:
+        volume = validate_name(volume, label="имя Modal volume")
+        completed = self._run_modal(
+            alias,
+            ["volume", "ls", "--json", *self._environment_args(environment), volume, path],
+            capture_output=True,
+        )
+        try:
+            rows = json.loads(completed.stdout or "[]")
+        except json.JSONDecodeError as exc:
+            raise ExternalCommandError("modal volume ls вернул некорректный JSON") from exc
+        if not isinstance(rows, list):
+            raise ExternalCommandError("modal volume ls вернул неожиданный JSON-формат")
+        for row in rows:
+            if not isinstance(row, dict) or not isinstance(row.get("filename"), str) or not isinstance(row.get("type"), str):
+                raise ExternalCommandError("modal volume ls вернул неожиданную строку JSON")
+        return rows
+
+    def preflight_volume_transfer(
+        self,
+        source_alias: str,
+        destination_alias: str,
+        volume: str,
+        *,
+        destination_volume: str,
+        force: bool,
+        source_environment: str | None,
+        destination_environment: str | None,
+    ) -> list[str]:
+        source_names = self.list_volume_names(source_alias, environment=source_environment)
+        if volume not in source_names:
+            raise CockpitError(f"volume {volume!r} не найден в аккаунте {source_alias!r}")
+        destination_names = self.list_volume_names(destination_alias, environment=destination_environment)
+        if destination_volume in destination_names and not force:
+            entries = self.list_volume_entries(
+                destination_alias,
+                destination_volume,
+                environment=destination_environment,
+            )
+            if entries:
+                raise CockpitError(
+                    f"целевой volume {destination_volume!r} уже содержит данные; "
+                    "используйте --force для merge/overwrite или выберите --dest-volume"
+                )
+        return destination_names
+
+    @staticmethod
+    def _inspect_staging_tree(staging: Path) -> tuple[list[Path], int, int]:
+        files: list[Path] = []
+        directories = 0
+        special_entries = 0
+        for root, dirnames, filenames in os.walk(staging, followlinks=False):
+            root_path = Path(root)
+            for dirname in list(dirnames):
+                mode = (root_path / dirname).lstat().st_mode
+                if stat.S_ISDIR(mode):
+                    directories += 1
+                else:
+                    special_entries += 1
+                    dirnames.remove(dirname)
+            for filename in filenames:
+                mode = (root_path / filename).lstat().st_mode
+                if stat.S_ISREG(mode):
+                    files.append(root_path / filename)
+                else:
+                    special_entries += 1
+        if special_entries:
+            raise CockpitError(
+                f"staging содержит {special_entries} symlink/special entries; transfer остановлен до upload"
+            )
+        byte_count = sum(path.stat().st_size for path in files)
+        return files, byte_count, directories
+
+    def create_volume(self, alias: str, volume: str, *, environment: str | None = None) -> None:
+        volume = validate_name(volume, label="имя Modal volume")
+        self._run_modal(alias, ["volume", "create", *self._environment_args(environment), volume], capture_output=True)
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _file_manifest(self, root: Path, files: Sequence[Path]) -> dict[str, tuple[int, str]]:
+        return {
+            path.relative_to(root).as_posix(): (path.stat().st_size, self._sha256_file(path))
+            for path in files
+        }
+
+    def transfer_volume(
+        self,
+        source_alias: str,
+        destination_alias: str,
+        volume: str,
+        *,
+        destination_volume: str | None = None,
+        force: bool = False,
+        staging_parent: Path | None = None,
+        source_environment: str | None = None,
+        destination_environment: str | None = None,
+        verify: bool = False,
+    ) -> dict[str, Any]:
+        """Copy a whole Modal volume through local temporary staging.
+
+        This is a copy-first operation: the source volume is never deleted or mutated.
+        Only regular files are guaranteed to transfer. Empty directories, symlinks,
+        special file types and timestamps are not preserved by the Modal CLI path.
+        """
+
+        source_alias = validate_name(source_alias, label="исходный аккаунт")
+        destination_alias = validate_name(destination_alias, label="целевой аккаунт")
+        volume = validate_name(volume, label="исходный volume")
+        destination_volume = validate_name(destination_volume or volume, label="целевой volume")
+        if source_alias == destination_alias:
+            raise CockpitError("transfer предназначен для копирования между разными аккаунтами")
+        if volume.startswith("-") or destination_volume.startswith("-"):
+            raise CockpitError("имена volumes не должны начинаться с '-'")
+
+        destination_names = self.preflight_volume_transfer(
+            source_alias,
+            destination_alias,
+            volume,
+            destination_volume=destination_volume,
+            force=force,
+            source_environment=source_environment,
+            destination_environment=destination_environment,
+        )
+        created_volume = False
+
+        if staging_parent is None:
+            parent = self.store.root / "tmp"
+            ensure_private_dir(parent)
+        else:
+            parent = staging_parent.expanduser()
+            parent.mkdir(parents=True, exist_ok=True)
+
+        with tempfile.TemporaryDirectory(prefix="volume-transfer-", dir=parent) as temp_dir:
+            staging = Path(temp_dir)
+            self._run_modal(
+                source_alias,
+                [
+                    "volume",
+                    "get",
+                    *self._environment_args(source_environment),
+                    volume,
+                    "/",
+                    str(staging),
+                ],
+            )
+            files, byte_count, directories = self._inspect_staging_tree(staging)
+            source_manifest = self._file_manifest(staging, files)
+            if destination_volume not in destination_names:
+                self.create_volume(destination_alias, destination_volume, environment=destination_environment)
+                created_volume = True
+            if files:
+                self._run_modal(
+                    destination_alias,
+                    [
+                        "volume",
+                        "put",
+                        *(["--force"] if force else []),
+                        *self._environment_args(destination_environment),
+                        destination_volume,
+                        str(staging),
+                        "/.",
+                    ],
+                )
+
+        verified = False
+        if verify and files:
+            with tempfile.TemporaryDirectory(prefix="volume-verify-", dir=parent) as verify_dir:
+                verify_staging = Path(verify_dir)
+                self._run_modal(
+                    destination_alias,
+                    [
+                        "volume",
+                        "get",
+                        *self._environment_args(destination_environment),
+                        destination_volume,
+                        "/",
+                        str(verify_staging),
+                    ],
+                )
+                verify_files, _, _ = self._inspect_staging_tree(verify_staging)
+                verify_manifest = self._file_manifest(verify_staging, verify_files)
+            mismatches = [
+                relative
+                for relative, expected in source_manifest.items()
+                if verify_manifest.get(relative) != expected
+            ]
+            if mismatches:
+                raise CockpitError(
+                    f"verification failed для {len(mismatches)} файлов; destination не откатывался автоматически"
+                )
+            verified = True
+        elif verify:
+            verified = True
+
+        return {
+            "source_account": source_alias,
+            "destination_account": destination_alias,
+            "source_volume": volume,
+            "destination_volume": destination_volume,
+            "created_volume": created_volume,
+            "files": len(files),
+            "directories": directories,
+            "bytes": byte_count,
+            "verified": verified,
+        }
+
+    def transfer_volumes(
+        self,
+        source_alias: str,
+        destination_alias: str,
+        *,
+        volumes: Sequence[str] | None = None,
+        force: bool = False,
+        staging_parent: Path | None = None,
+        source_environment: str | None = None,
+        destination_environment: str | None = None,
+        verify: bool = False,
+    ) -> list[dict[str, Any]]:
+        if volumes is None:
+            names = self.list_volume_names(source_alias, environment=source_environment)
+        else:
+            names = []
+            for volume in volumes:
+                volume = validate_name(volume, label="имя Modal volume")
+                if volume not in names:
+                    names.append(volume)
+        for volume in names:
+            self.preflight_volume_transfer(
+                source_alias,
+                destination_alias,
+                volume,
+                destination_volume=volume,
+                force=force,
+                source_environment=source_environment,
+                destination_environment=destination_environment,
+            )
+        results = []
+        for volume in names:
+            results.append(
+                self.transfer_volume(
+                    source_alias,
+                    destination_alias,
+                    volume,
+                    force=force,
+                    staging_parent=staging_parent,
+                    source_environment=source_environment,
+                    destination_environment=destination_environment,
+                    verify=verify,
+                )
+            )
+        return results
 
     def login_with_modal_cli(
         self,

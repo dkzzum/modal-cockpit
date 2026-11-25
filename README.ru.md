@@ -1,6 +1,6 @@
 # modal-cockpit
 
-`modal-cockpit` — локальный CLI-инструмент для безопасного управления несколькими аккаунтами [Modal](https://modal.com/) и переключения между ними в одно действие. Он использует штатную multi-profile модель Modal и добавляет зашифрованные снапшоты аккаунтов, backup перед изменениями, блокировку от параллельных операций, атомарную запись и изолированный запуск команд под разными аккаунтами.
+`modal-cockpit` — локальный CLI-инструмент для безопасного управления несколькими аккаунтами [Modal](https://modal.com/) и переключения между ними в одно действие. Он использует штатную multi-profile модель Modal и добавляет зашифрованные снапшоты аккаунтов, backup перед изменениями, блокировку от параллельных операций, атомарную запись, изолированный запуск команд под разными аккаунтами и copy-first перенос Modal Volumes между аккаунтами.
 
 Инструмент работает с авторизацией **Modal CLI/API**, то есть с профилями в `~/.modal.toml`. Он не управляет cookie/browser-сессиями веб-интерфейса modal.com.
 
@@ -156,6 +156,45 @@ unset MODAL_PROFILE
 
 Если `MODAL_PROFILE` уже установлен в shell, он имеет приоритет над `active = true` в файле. `modal-cockpit current` и `doctor` явно показывают такой override.
 
+## Копирование volumes между аккаунтами
+
+Команда `transfer` копирует весь Modal Volume из одного управляемого аккаунта в другой через временное локальное хранилище. Она нужна для миграции и аварийной эвакуации данных — например, если на исходном аккаунте заканчиваются деньги.
+
+Скопировать один volume:
+
+```bash
+modal-cockpit transfer personal work my-volume --yes
+```
+
+Скопировать все volumes, видимые в исходном аккаунте:
+
+```bash
+modal-cockpit transfer personal work --all-volumes --yes
+```
+
+Полезные опции:
+
+```bash
+modal-cockpit transfer personal work my-volume --dest-volume rescued-volume --yes
+modal-cockpit transfer personal work my-volume --staging-dir /path/to/large/disk --yes
+modal-cockpit transfer personal work my-volume --source-env main --dest-env main --yes
+modal-cockpit transfer personal work my-volume --verify --yes
+```
+
+Важные свойства и ограничения:
+
+- это copy-first операция: исходные volumes не изменяются и не удаляются;
+- целевой volume создаётся автоматически, если его нет;
+- без `--force` непустой целевой volume останавливает перенос ещё на preflight, до скачивания; `--force` означает merge/overwrite, а не mirror — лишние файлы в destination остаются;
+- все данные временно записываются на локальный диск, поэтому нужно достаточно свободного места. Через `--staging-dir` можно выбрать большой диск;
+- во время переноса данные локально лежат в plaintext; временная директория удаляется после нормального завершения, но может остаться после SIGKILL/отключения питания;
+- symlink и special file types, найденные в staging, останавливают transfer до upload; пустые директории, timestamps и executable bits не гарантированно сохраняются;
+- копирование живого volume не является snapshot-consistent; сначала остановите писателей. При ошибке upload целевой volume может остаться частично скопированным;
+- `--verify` повторно скачивает destination и сравнивает SHA-256 скопированных файлов. Это увеличивает bandwidth/время и не откатывает failed copy;
+- transfer не обходит биллинговые или access restrictions Modal: исходный аккаунт всё ещё должен иметь возможность читать volume;
+- metadata/backend version volume не копируются; автоматически созданные volumes используют настройки Modal по умолчанию. Проверено с Modal CLI 1.6.4;
+- legacy `modal.NetworkFileSystem` этой командой не поддерживается.
+
 ## Восстановление и backups
 
 Ручной backup:
@@ -229,6 +268,7 @@ modal-cockpit doctor --fix-permissions
 | `current` | активный профиль с учётом `MODAL_PROFILE` |
 | `exec <alias> -- cmd ...` | запустить команду под аккаунтом без глобального переключения |
 | `env <alias>` | вывести shell-команды для `eval` |
+| `transfer` | копирование одного или всех Modal Volumes между аккаунтами через локальное временное хранилище |
 | `backup` / `backups` / `restore` | encrypted backups всей конфигурации |
 | `remove` | удалить account snapshot; `--delete-profile` также удаляет неактивную секцию |
 | `doctor` | диагностика и исправление прав |

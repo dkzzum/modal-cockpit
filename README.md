@@ -2,7 +2,7 @@
 
 `modal-cockpit` is a local command-line tool for safely managing and switching multiple [Modal](https://modal.com/) CLI accounts.
 
-It uses Modal's native multi-profile configuration and adds one-command switching, encrypted account snapshots, encrypted whole-config backups, atomic writes, cross-process locking, profile restoration, and isolated execution under different accounts.
+It uses Modal's native multi-profile configuration and adds one-command switching, encrypted account snapshots, encrypted whole-config backups, atomic writes, cross-process locking, profile restoration, isolated execution under different accounts, and copy-first transfer of Modal Volumes between accounts.
 
 Русская версия документации: [README.ru.md](README.ru.md).
 
@@ -162,6 +162,45 @@ unset MODAL_PROFILE
 
 `MODAL_PROFILE` takes precedence over `active = true` in the TOML file. `modal-cockpit current` and `doctor` explicitly show this override.
 
+## Copying volumes between accounts
+
+`transfer` copies a whole Modal Volume from one managed account to another through local temporary staging. It is intended for account migration and emergency evacuation of data, for example when a source account is running out of credits.
+
+Copy one volume:
+
+```bash
+modal-cockpit transfer personal work my-volume --yes
+```
+
+Copy every volume visible in the source account:
+
+```bash
+modal-cockpit transfer personal work --all-volumes --yes
+```
+
+Useful options:
+
+```bash
+modal-cockpit transfer personal work my-volume --dest-volume rescued-volume --yes
+modal-cockpit transfer personal work my-volume --staging-dir /path/to/large/disk --yes
+modal-cockpit transfer personal work my-volume --source-env main --dest-env main --yes
+modal-cockpit transfer personal work my-volume --verify --yes
+```
+
+Important behavior and limitations:
+
+- this is copy-first: source volumes are never modified or deleted;
+- the destination volume is created automatically if it does not exist;
+- without `--force`, a non-empty destination volume aborts during preflight before any download; `--force` means merge/overwrite, not mirror — extra destination files remain;
+- all data is temporarily written to local disk, so enough free space is required. Use `--staging-dir` to choose a larger disk;
+- temporary data is deleted after a normal exit, but it is plaintext while the transfer is running and can remain after SIGKILL/power loss;
+- symlinks and special file types detected in staging abort the transfer before upload; empty directories, timestamps and executable bits are not guaranteed to be preserved;
+- copying a live volume is not snapshot-consistent; stop writers first. A failed upload can leave a partial destination volume;
+- `--verify` re-downloads the destination and compares SHA-256 for copied files. It increases bandwidth/time and does not roll back a failed copy;
+- transfer cannot bypass Modal billing or access restrictions: the source account must still be able to read the volume;
+- volume metadata/backend version is not copied; auto-created volumes use Modal defaults. Tested against Modal CLI 1.6.4;
+- legacy `modal.NetworkFileSystem` objects are not supported by this command.
+
 ## Backups and recovery
 
 Create a manual encrypted backup:
@@ -235,6 +274,7 @@ modal-cockpit doctor --fix-permissions
 | `current` | show the active profile, including `MODAL_PROFILE` override |
 | `exec <alias> -- cmd ...` | run one command as an account without global switching |
 | `env <alias>` | print shell commands for `eval` |
+| `transfer` | copy one or all Modal Volumes between accounts through local staging |
 | `backup` / `backups` / `restore` | manage encrypted whole-config backups |
 | `remove` | remove an account snapshot; optionally remove an inactive profile |
 | `doctor` | validate configuration, store, permissions, and env overrides |

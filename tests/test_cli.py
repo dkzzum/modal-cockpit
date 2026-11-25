@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from modal_cockpit.cli import main
+from modal_cockpit.core import ModalCockpit
 
 from .conftest import read_toml
 
@@ -59,3 +60,54 @@ def test_cli_version(capsys):
         assert exc.code == 0
     output = capsys.readouterr().out
     assert output.startswith("modal-cockpit ")
+
+
+def test_cli_transfer_requires_confirmation(tmp_path: Path):
+    args = base_args(tmp_path)
+    assert main(args + ["transfer", "alpha", "beta", "data"]) == 2
+
+
+def test_cli_transfer_passes_options(tmp_path: Path, monkeypatch, capsys):
+    captured = {}
+
+    def fake_transfer(self, source, destination, volume, **kwargs):
+        captured.update({"source": source, "destination": destination, "volume": volume, **kwargs})
+        return {
+            "source_volume": volume,
+            "destination_volume": kwargs.get("destination_volume") or volume,
+            "created_volume": True,
+            "files": 2,
+            "bytes": 12,
+        }
+
+    monkeypatch.setattr(ModalCockpit, "transfer_volume", fake_transfer)
+    args = base_args(tmp_path)
+    rc = main(
+        args
+        + [
+            "transfer",
+            "alpha",
+            "beta",
+            "data",
+            "--dest-volume",
+            "data-copy",
+            "--force",
+            "--yes",
+            "--source-env",
+            "main",
+            "--dest-env",
+            "backup",
+        ]
+    )
+
+    assert rc == 0
+    assert captured["source"] == "alpha"
+    assert captured["destination"] == "beta"
+    assert captured["volume"] == "data"
+    assert captured["destination_volume"] == "data-copy"
+    assert captured["force"] is True
+    assert captured["source_environment"] == "main"
+    assert captured["destination_environment"] == "backup"
+    output = capsys.readouterr().out
+    assert "transferred: data -> data-copy" in output
+    assert "source volumes were not modified or deleted" in output

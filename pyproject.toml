@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "modal-cockpit"
-version = "0.1.0"
-description = "Safe multi-account switcher for Modal CLI profiles"
+version = "0.2.0"
+description = "Safe multi-account switcher and volume transfer tool for Modal CLI profiles"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "PolyForm-Noncommercial-1.0.0"
