@@ -61,7 +61,8 @@ def canonical_json_bytes(value: Any) -> bytes:
 
 
 def validate_name(value: str, *, label: str) -> str:
-    value = value.strip()
+    if value != value.strip():
+        raise StoreError(f"{label} не должно содержать leading/trailing whitespace")
     if not value:
         raise StoreError(f"{label} не может быть пустым")
     if len(value) > 256:

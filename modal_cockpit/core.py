@@ -107,12 +107,20 @@ class ModalCockpit:
         exclude_alias: str | None = None,
     ) -> list[str]:
         synced: list[str] = []
-        for alias, meta in self.store.load_index()["accounts"].items():
+        index = self.store.load_index()
+        if index.get("restore_protection"):
+            return []
+        for alias, meta in index["accounts"].items():
             if alias == exclude_alias:
                 continue
             profile = meta.get("modal_profile")
             if isinstance(profile, str) and profile in data:
-                self.store.save_account(alias, profile, section_without_active(data[profile]))
+                live = section_without_active(data[profile])
+                try:
+                    self._validate_auth_section(live)
+                except StoreError:
+                    continue
+                self.store.save_account(alias, profile, live)
                 synced.append(alias)
         return synced
 
@@ -120,6 +128,9 @@ class ModalCockpit:
         """Refresh encrypted snapshots for managed profiles currently present in Modal config."""
 
         with self.store.lock():
+            index = self.store.load_index()
+            index.pop("restore_protection", None)
+            self.store.save_index(index)
             cfg = self._load_config()
             return self._sync_managed_from_data_locked(cfg.data)
 
@@ -141,6 +152,21 @@ class ModalCockpit:
                     "используйте --force для перепривязки"
                 )
             return self.store.save_account(alias, profile, section_without_active(cfg.data[profile]))
+
+    @staticmethod
+    def _validate_auth_section(section: dict[str, Any]) -> None:
+        token_present = any(key in section for key in TOKEN_CONFIG_KEYS)
+        oauth_present = any(key in section for key in OAUTH_CONFIG_KEYS)
+        if token_present and oauth_present:
+            raise StoreError("Modal не допускает одновременную token и OAuth авторизацию в одном профиле")
+        if token_present and not all(isinstance(section.get(key), str) and section.get(key) for key in TOKEN_CONFIG_KEYS):
+            raise StoreError("token_id и token_secret должны быть непустыми и заданы вместе")
+        if oauth_present:
+            required = ("oauth_refresh_token", "oauth_client_id")
+            if not all(isinstance(section.get(key), str) and section.get(key) for key in required):
+                raise StoreError("OAuth profile должен содержать oauth_refresh_token и oauth_client_id")
+            if not (section.get("oauth_client_secret") or section.get("oauth_jwt_key")):
+                raise StoreError("OAuth profile должен содержать oauth_client_secret или oauth_jwt_key")
 
     def _merge_authenticated_section(
         self,
@@ -167,12 +193,7 @@ class ModalCockpit:
         profile = validate_name(profile or alias, label="имя Modal profile")
         if not isinstance(section, dict) or not section:
             raise StoreError("импортируемая секция профиля пуста или повреждена")
-        has_token_auth = any(section.get(key) for key in TOKEN_CONFIG_KEYS)
-        has_oauth_auth = any(section.get(key) for key in OAUTH_CONFIG_KEYS)
-        if has_token_auth and not all(section.get(key) for key in TOKEN_CONFIG_KEYS):
-            raise StoreError("token_id и token_secret должны быть заданы вместе")
-        if has_token_auth and has_oauth_auth:
-            raise StoreError("Modal не допускает одновременную token и OAuth авторизацию в одном профиле")
+        self._validate_auth_section(section)
         with self.store.lock():
             existing_meta = self.store.load_index()["accounts"].get(alias)
             if existing_meta and existing_meta.get("modal_profile") != profile:
@@ -181,6 +202,8 @@ class ModalCockpit:
                 )
             self.store._validate_unique_profile(alias, profile)
             self.store.cipher.validate_or_create_key()
+            if self.store.account_path(alias).exists():
+                self.store.load_account(alias)
             cfg = self._load_config()
             ensure_no_multiple_active(cfg.data)
             backup_id = self._backup_if_exists(cfg, reason)
@@ -233,8 +256,9 @@ class ModalCockpit:
 
             synced = self._sync_managed_from_data_locked(cfg.data, exclude_alias=alias if force_snapshot else None)
             account = self.store.load_account(alias)
+            protected = self.store.load_index().get("restore_protection")
             restored_missing = modal_profile not in cfg.data
-            if restored_missing or force_snapshot:
+            if restored_missing or force_snapshot or protected:
                 upsert_profile_section(cfg.doc, modal_profile, account["section"], replace=True)
 
             set_only_active_profile(cfg.doc, modal_profile)
@@ -269,8 +293,11 @@ class ModalCockpit:
             modal_profile = account["modal_profile"]
             cfg = self._load_config()
             ensure_no_multiple_active(cfg.data)
-            if modal_profile in cfg.data:
+            protected = self.store.load_index().get("restore_protection")
+            if modal_profile in cfg.data and not protected:
                 self.store.save_account(alias, modal_profile, section_without_active(cfg.data[modal_profile]))
+                return False
+            if modal_profile in cfg.data and section_without_active(cfg.data[modal_profile]) == account["section"]:
                 return False
             self._backup_if_exists(cfg, f"before-restore-profile-{alias}")
             upsert_profile_section(cfg.doc, modal_profile, account["section"], replace=True)
@@ -294,8 +321,13 @@ class ModalCockpit:
             cfg = self._load_config()
             pre_restore_backup = self._backup_if_exists(cfg, "before-restore")
             text = payload["text"]
-            validate_rendered_config(text)
+            if "source_path" in payload and Path(payload["source_path"]).resolve() != self.config_path:
+                raise ConfigError(f"backup создан для другого Modal config: {payload['source_path']}")
+            validate_rendered_config(text, allow_multiple_active=True)
             self._write_config_transaction(cfg, text)
+            index = self.store.load_index()
+            index["restore_protection"] = True
+            self.store.save_index(index)
             return pre_restore_backup
 
     def remove_account(self, alias: str, *, delete_profile: bool = False) -> dict[str, Any]:

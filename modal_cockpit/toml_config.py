@@ -146,14 +146,14 @@ def render_toml(doc: tomlkit.TOMLDocument) -> str:
     return tomlkit.dumps(doc)
 
 
-def validate_rendered_config(text: str, *, expected_active: str | None = None) -> dict[str, dict[str, Any]]:
+def validate_rendered_config(text: str, *, expected_active: str | None = None, allow_multiple_active: bool = False) -> dict[str, dict[str, Any]]:
     try:
         parsed = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"внутренняя ошибка: сгенерирован повреждённый TOML: {exc}") from exc
     data = _validate_top_level(parsed, Path("<memory>"))
     actives = active_profiles(data)
-    if len(actives) > 1:
+    if len(actives) > 1 and not allow_multiple_active:
         raise ConfigError("внутренняя ошибка: сгенерировано несколько активных профилей")
     if expected_active is not None:
         if expected_active not in data:

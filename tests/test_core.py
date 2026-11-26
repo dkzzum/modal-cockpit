@@ -1167,3 +1167,36 @@ def test_valid_json_but_semantically_corrupt_index_fails_closed(cockpit):
 
     with pytest.raises(StoreError):
         cockpit.list_accounts()
+
+
+def test_restore_multiple_active_backup_and_protects_newer_snapshot(cockpit):
+    cockpit.add_token_account("alpha", profile=None, token_id="ak-old", token_secret="as-old", activate=True)
+    backup_id = cockpit.backup_now()
+    text = cockpit.config_path.read_text(encoding="utf-8").replace("ak-old", "ak-new").replace("as-old", "as-new")
+    cockpit.config_path.write_text(text, encoding="utf-8")
+    cockpit.sync()
+    cockpit.restore_backup(backup_id)
+    cockpit.ensure_profile_present("alpha")
+    assert cockpit.store.load_account("alpha")["section"]["token_id"] == "ak-new"
+    cockpit.sync()
+    assert cockpit.store.load_account("alpha")["section"]["token_id"] == "ak-new"
+
+
+def test_restore_backup_of_multiple_active_state(cockpit, tmp_path: Path):
+    original = '[a]\nactive = true\n\n[b]\nactive = true\n'
+    cockpit.config_path.write_text(original, encoding="utf-8")
+    backup_id = cockpit.backup_now()
+    cockpit.config_path.write_text('[x]\nactive = true\n', encoding="utf-8")
+    cockpit.restore_backup(backup_id)
+    assert cockpit.config_path.read_text(encoding="utf-8") == original
+
+
+def test_partial_auth_import_and_corrupt_snapshot_fail_before_config_write(cockpit):
+    cockpit.add_token_account("alpha", profile=None, token_id="ak-alpha", token_secret="as-alpha", activate=True)
+    before = cockpit.config_path.read_text(encoding="utf-8")
+    with pytest.raises(StoreError):
+        cockpit.import_profile_section("alpha", profile="alpha", section={"oauth_client_secret": "x"}, reason="t")
+    cockpit.store.account_path("alpha").write_text("corrupted", encoding="utf-8")
+    with pytest.raises(CryptoError):
+        cockpit.add_token_account("alpha", profile=None, token_id="ak-new", token_secret="as-new")
+    assert cockpit.config_path.read_text(encoding="utf-8") == before
