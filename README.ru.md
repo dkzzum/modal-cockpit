@@ -137,7 +137,7 @@ modal-cockpit switch work --verify
 
 ### 5. Параллельная работа без глобального переключения
 
-`exec` выставляет `MODAL_PROFILE` только для одной команды:
+`exec` выставляет `MODAL_PROFILE` и управляемый `MODAL_CONFIG_PATH` только для одной команды. По умолчанию он также удаляет credential overrides и transport overrides (`MODAL_ENVIRONMENT`, `MODAL_SERVER_URL`, `MODAL_STREAMS_URL`, `MODAL_OVERRIDE_HEADERS`, `MODAL_DISABLE_API_PROXY`), чтобы унаследованное состояние shell не отправило команду в другой аккаунт или endpoint. Остальные optional feature flags Modal сознательно наследуются; `--keep-env` нужен только если осознанно требуется сохранить и credential variables. Команда `env` выводит соответствующие `unset`:
 
 ```bash
 modal-cockpit exec personal -- modal app list
@@ -192,9 +192,9 @@ modal-cockpit transfer personal work my-volume --verify --yes
 - без `--force` непустой целевой volume останавливает перенос ещё на preflight, до скачивания; `--force` означает merge/overwrite, а не mirror — лишние файлы в destination остаются;
 - все данные временно записываются на локальный диск, поэтому нужно достаточно свободного места. Через `--staging-dir` можно выбрать большой диск;
 - во время переноса данные локально лежат в plaintext; временная директория удаляется после нормального завершения, но может остаться после SIGKILL/отключения питания;
-- symlink и special file types, найденные в staging, останавливают transfer до upload; пустые директории, timestamps и executable bits не гарантированно сохраняются;
+- переносятся только regular files. Modal CLI может не скачать symlink/special entries в staging вообще; любые такие объекты, обнаруженные локально, останавливают transfer до upload. Пустые директории, timestamps и executable bits не гарантированно сохраняются;
 - копирование живого volume не является snapshot-consistent; сначала остановите писателей. При ошибке upload целевой volume может остаться частично скопированным;
-- `--verify` повторно скачивает destination и сравнивает SHA-256 скопированных файлов. Это увеличивает bandwidth/время и не откатывает failed copy;
+- `--verify` повторно скачивает destination и сравнивает SHA-256 скопированных файлов. Это проверяет upload-сторону, но не может независимо доказать корректность исходного download Modal CLI; проверка увеличивает bandwidth/время и не откатывает failed copy;
 - transfer не обходит биллинговые или access restrictions Modal: исходный аккаунт всё ещё должен иметь возможность читать volume;
 - metadata/backend version volume не копируются; автоматически созданные volumes используют настройки Modal по умолчанию. Проверено с Modal CLI 1.6.4;
 - legacy `modal.NetworkFileSystem` этой командой не поддерживается.
@@ -256,7 +256,8 @@ modal-cockpit doctor --fix-permissions
 - ровно один активный профиль;
 - права конфигурации;
 - читаемость encrypted snapshots;
-- `MODAL_PROFILE` и credential env overrides.
+- `MODAL_PROFILE` и credential env overrides;
+- stale plaintext temporary directories после прерванных transfer/login. Они показываются в диагностике, но автоматически не удаляются.
 
 ## Команды
 

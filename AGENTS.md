@@ -146,7 +146,10 @@ A transfer is copy-first, not mirror and not deletion:
 - destination-only files remain after a `--force` merge;
 - an interrupted upload can leave a partial destination volume;
 - `--verify` compares copied files by re-downloading the destination, but it
-  does not roll back failures.
+  does not independently prove the original source download and does not roll
+  back failures;
+- only regular files are reliably transferred; empty directories, timestamps,
+  executable bits, symlinks and other special filesystem entries may be omitted.
 
 Never delete the source volume or otherwise "clean up" the source account after
 a transfer. Even after successful verification, deletion is a separate

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import io
+import sys
 from pathlib import Path
 
-from modal_cockpit.cli import main
+from modal_cockpit.cli import confirm_or_fail, main
 from modal_cockpit.core import ModalCockpit
 
 from .conftest import read_toml
@@ -49,6 +51,8 @@ def test_cli_env_emits_only_profile_metadata(tmp_path: Path, capsys):
     output = capsys.readouterr().out
     assert "MODAL_PROFILE=alpha" in output
     assert "MODAL_CONFIG_PATH=" in output
+    assert "unset MODAL_ENVIRONMENT" in output
+    assert "unset MODAL_SERVER_URL" in output
     assert "ak-alpha" not in output
     assert "as-alpha" not in output
 
@@ -111,3 +115,17 @@ def test_cli_transfer_passes_options(tmp_path: Path, monkeypatch, capsys):
     output = capsys.readouterr().out
     assert "transferred: data -> data-copy" in output
     assert "source volumes were not modified or deleted" in output
+
+
+def test_confirmation_prompt_goes_to_stderr(monkeypatch, capsys):
+    class TtyInput(io.StringIO):
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr(sys, "stdin", TtyInput("yes\n"))
+
+    confirm_or_fail("test action", False, "subject")
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "test action" in captured.err

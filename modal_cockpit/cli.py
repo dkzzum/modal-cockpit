@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .core import CREDENTIAL_ENV_VARS, ModalCockpit
+from .core import CREDENTIAL_ENV_VARS, TRANSPORT_ENV_VARS, ModalCockpit
 from .errors import CockpitError
 from .paths import coerce_path, default_modal_config_path, default_store_home
 
@@ -30,7 +30,7 @@ def print_json(value: Any) -> None:
 
 def read_secret(value: str | None, prompt: str) -> str:
     if value == "-":
-        return sys.stdin.readline().rstrip("\n")
+        return sys.stdin.readline().rstrip("\r\n")
     if value is not None:
         return value
     return getpass.getpass(prompt)
@@ -41,8 +41,9 @@ def confirm_or_fail(action: str, yes: bool, subject: str) -> None:
         return
     if not sys.stdin.isatty():
         raise CockpitError(f"{action} требует подтверждения; повторите с --yes")
-    answer = input(f"{action}: {subject}. Введите 'yes' для подтверждения: ")
-    if answer != "yes":
+    print(f"{action}: {subject}. Введите 'yes' для подтверждения: ", end="", file=sys.stderr, flush=True)
+    answer = sys.stdin.readline()
+    if answer.rstrip("\r\n") != "yes":
         raise CockpitError("операция отменена")
 
 
@@ -213,6 +214,8 @@ def cmd_env(args: argparse.Namespace) -> int:
     env = cockpit.build_exec_environment(args.alias, keep_credential_env=args.keep_env)
     print(f"export MODAL_PROFILE={shell_quote(env['MODAL_PROFILE'])}")
     print(f"export MODAL_CONFIG_PATH={shell_quote(env['MODAL_CONFIG_PATH'])}")
+    for name in TRANSPORT_ENV_VARS:
+        print(f"unset {name}")
     if not args.keep_env:
         for name in CREDENTIAL_ENV_VARS:
             print(f"unset {name}")

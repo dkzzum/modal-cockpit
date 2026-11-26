@@ -143,7 +143,7 @@ modal-cockpit switch work --verify
 
 ### 5. Run commands in parallel without switching globally
 
-`exec` sets `MODAL_PROFILE` only for one child process:
+`exec` sets `MODAL_PROFILE` and the managed `MODAL_CONFIG_PATH` only for one child process. By default it also removes credential overrides plus transport overrides such as `MODAL_ENVIRONMENT`, `MODAL_SERVER_URL`, `MODAL_STREAMS_URL`, `MODAL_OVERRIDE_HEADERS` and `MODAL_DISABLE_API_PROXY`, so inherited shell state cannot silently redirect the command to another account or endpoint. Other optional Modal feature flags are intentionally inherited; use `--keep-env` only when credential variables are also needed. The `env` command emits matching `unset` commands:
 
 ```bash
 modal-cockpit exec personal -- modal app list
@@ -198,9 +198,9 @@ Important behavior and limitations:
 - without `--force`, a non-empty destination volume aborts during preflight before any download; `--force` means merge/overwrite, not mirror — extra destination files remain;
 - all data is temporarily written to local disk, so enough free space is required. Use `--staging-dir` to choose a larger disk;
 - temporary data is deleted after a normal exit, but it is plaintext while the transfer is running and can remain after SIGKILL/power loss;
-- symlinks and special file types detected in staging abort the transfer before upload; empty directories, timestamps and executable bits are not guaranteed to be preserved;
+- only regular files are transferred. Modal CLI may omit symlinks or special entries before they ever reach local staging; any symlink or special file that is detected in staging aborts the transfer before upload. Empty directories, timestamps and executable bits are not guaranteed to be preserved;
 - copying a live volume is not snapshot-consistent; stop writers first. A failed upload can leave a partial destination volume;
-- `--verify` re-downloads the destination and compares SHA-256 for copied files. It increases bandwidth/time and does not roll back a failed copy;
+- `--verify` re-downloads the destination and compares SHA-256 for copied files. It validates the upload side, but cannot independently prove that Modal's original source download was correct; it increases bandwidth/time and does not roll back a failed copy;
 - transfer cannot bypass Modal billing or access restrictions: the source account must still be able to read the volume;
 - volume metadata/backend version is not copied; auto-created volumes use Modal defaults. Tested against Modal CLI 1.6.4;
 - legacy `modal.NetworkFileSystem` objects are not supported by this command.
@@ -262,7 +262,8 @@ modal-cockpit doctor --fix-permissions
 - whether exactly one profile is active;
 - config file permissions;
 - readability of encrypted account snapshots;
-- `MODAL_PROFILE` and credential environment overrides.
+- `MODAL_PROFILE` and credential environment overrides;
+- stale plaintext temporary directories left by interrupted transfers or logins. They are reported, not deleted automatically.
 
 ## Command reference
 

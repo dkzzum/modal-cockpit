@@ -41,6 +41,13 @@ CREDENTIAL_ENV_VARS = (
     "MODAL_OAUTH_CLIENT_SECRET",
     "MODAL_OAUTH_JWT_KEY",
 )
+TRANSPORT_ENV_VARS = (
+    "MODAL_ENVIRONMENT",
+    "MODAL_SERVER_URL",
+    "MODAL_STREAMS_URL",
+    "MODAL_OVERRIDE_HEADERS",
+    "MODAL_DISABLE_API_PROXY",
+)
 OAUTH_CONFIG_KEYS = (
     "oauth_refresh_token",
     "oauth_client_id",
@@ -284,8 +291,12 @@ class ModalCockpit:
     def remove_account(self, alias: str, *, delete_profile: bool = False) -> dict[str, Any]:
         alias = validate_name(alias, label="имя аккаунта")
         with self.store.lock():
-            account = self.store.load_account(alias)
-            modal_profile = account["modal_profile"]
+            metadata = self.store.load_index()["accounts"].get(alias)
+            if metadata is None:
+                raise StoreError(f"аккаунт {alias!r} не найден в modal-cockpit")
+            modal_profile = metadata.get("modal_profile")
+            if not isinstance(modal_profile, str):
+                raise StoreError(f"metadata аккаунта {alias!r} повреждена")
             backup_id: str | None = None
             removed_profile = False
             if delete_profile:
@@ -306,13 +317,20 @@ class ModalCockpit:
             return {"alias": alias, "modal_profile": modal_profile, "removed_profile": removed_profile, "backup_id": backup_id}
 
     def list_accounts(self) -> dict[str, Any]:
-        cfg = self._load_config()
         active_error: str | None = None
         try:
-            file_active = detect_active_profile(cfg.data)
+            cfg = self._load_config()
+            config_data = cfg.data
         except ConfigError as exc:
+            config_data = {}
             file_active = None
             active_error = str(exc)
+        else:
+            try:
+                file_active = detect_active_profile(config_data)
+            except ConfigError as exc:
+                file_active = None
+                active_error = str(exc)
         env_override = os.environ.get("MODAL_PROFILE") or None
         active = env_override or file_active
         accounts = []
@@ -324,7 +342,7 @@ class ModalCockpit:
                     "alias": alias,
                     "modal_profile": profile,
                     "active": profile == active,
-                    "present_in_config": profile in cfg.data if isinstance(profile, str) else False,
+                    "present_in_config": profile in config_data if isinstance(profile, str) else False,
                     "auth_type": meta.get("auth_type"),
                     "token_id_sha256": meta.get("token_id_sha256"),
                     "created_at": meta.get("created_at"),
@@ -364,7 +382,8 @@ class ModalCockpit:
         env = os.environ.copy()
         env["MODAL_PROFILE"] = account["modal_profile"]
         env["MODAL_CONFIG_PATH"] = str(self.config_path)
-        env.pop("MODAL_ENVIRONMENT", None)
+        for name in TRANSPORT_ENV_VARS:
+            env.pop(name, None)
         if not keep_credential_env:
             for name in CREDENTIAL_ENV_VARS:
                 env.pop(name, None)
@@ -379,6 +398,8 @@ class ModalCockpit:
             completed = subprocess.run(list(command), env=env, check=False)
         except OSError as exc:
             raise ExternalCommandError(f"не удалось запустить команду {command[0]!r}: {exc}") from exc
+        if completed.returncode < 0:
+            return 128 + abs(completed.returncode)
         return completed.returncode
 
     @staticmethod
@@ -412,7 +433,7 @@ class ModalCockpit:
                     text=True,
                 )
             else:
-                completed = subprocess.run(command, env=env, check=False)
+                completed = subprocess.run(command, env=env, check=False, stdout=2)
         except OSError as exc:
             raise ExternalCommandError(f"не удалось запустить Modal CLI {modal!r}: {exc}") from exc
         if completed.returncode != 0:
@@ -699,18 +720,25 @@ class ModalCockpit:
             )
         results = []
         for volume in names:
-            results.append(
-                self.transfer_volume(
-                    source_alias,
-                    destination_alias,
-                    volume,
-                    force=force,
-                    staging_parent=staging_parent,
-                    source_environment=source_environment,
-                    destination_environment=destination_environment,
-                    verify=verify,
+            try:
+                results.append(
+                    self.transfer_volume(
+                        source_alias,
+                        destination_alias,
+                        volume,
+                        force=force,
+                        staging_parent=staging_parent,
+                        source_environment=source_environment,
+                        destination_environment=destination_environment,
+                        verify=verify,
+                    )
                 )
-            )
+            except CockpitError as exc:
+                completed = ", ".join(item["source_volume"] for item in results) or "(none)"
+                raise CockpitError(
+                    f"перенос volume {volume!r} завершился ошибкой после {len(results)}/{len(names)} "
+                    f"успешных volumes [{completed}]: {exc}"
+                ) from exc
         return results
 
     def login_with_modal_cli(
@@ -760,6 +788,8 @@ class ModalCockpit:
             write_text_atomic(temp_config, render_toml(doc), mode=0o600)
 
             env = os.environ.copy()
+            for name in (*CREDENTIAL_ENV_VARS, *TRANSPORT_ENV_VARS):
+                env.pop(name, None)
             env["MODAL_PROFILE"] = profile
             env["MODAL_CONFIG_PATH"] = str(temp_config)
             command = [modal, "token", "new", "--no-activate"]
@@ -775,6 +805,9 @@ class ModalCockpit:
             login_cfg = load_modal_config(temp_config)
             if profile not in login_cfg.data:
                 raise ExternalCommandError("modal token new завершился успешно, но не записал ожидаемый профиль")
+            login_section = login_cfg.data[profile]
+            if not any(login_section.get(key) for key in AUTH_CONFIG_KEYS):
+                raise ExternalCommandError("modal token new завершился успешно, но не записал credentials в профиль")
             return self.import_profile_section(
                 alias,
                 profile=profile,
@@ -842,6 +875,27 @@ class ModalCockpit:
                     add("error", f"account:{alias}", str(exc))
         except Exception as exc:  # noqa: BLE001
             add("error", "store-index", str(exc))
+
+        tmp_dir = self.store.root / "tmp"
+        if tmp_dir.exists():
+            try:
+                stale = sorted(
+                    path.name
+                    for pattern in ("volume-transfer-*", "volume-verify-*", "login-*")
+                    for path in tmp_dir.glob(pattern)
+                )
+            except OSError as exc:
+                add("warn", "temporary-files", f"не удалось проверить temporary directories: {exc}")
+            else:
+                if stale:
+                    add(
+                        "warn",
+                        "temporary-files",
+                        f"найдены остатки plaintext temporary directories: {len(stale)}; "
+                        "проверьте и удалите их вручную",
+                    )
+                else:
+                    add("ok", "temporary-files", "остатков plaintext temporary directories нет")
 
         if os.environ.get("MODAL_PROFILE"):
             add(

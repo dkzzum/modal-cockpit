@@ -11,7 +11,12 @@ from pathlib import Path
 import pytest
 
 from modal_cockpit.core import ModalCockpit
-from modal_cockpit.errors import CockpitError, ConfigError, ExternalCommandError
+from modal_cockpit.errors import (
+    CockpitError,
+    ConfigError,
+    ExternalCommandError,
+    StoreError,
+)
 
 from .conftest import read_toml
 
@@ -442,6 +447,19 @@ def install_fake_volume_modal(tmp_path: Path, monkeypatch, state: dict) -> Path:
             account = state.setdefault("profiles", {}).setdefault(profile, {"volumes": {}})
             volumes = account.setdefault("volumes", {})
 
+            def content_to_bytes(content):
+                if isinstance(content, str):
+                    return content.encode("utf-8")
+                if isinstance(content, dict) and isinstance(content.get("hex"), str):
+                    return bytes.fromhex(content["hex"])
+                raise TypeError("unsupported fake content")
+
+            def bytes_to_content(data):
+                try:
+                    return data.decode("utf-8")
+                except UnicodeDecodeError:
+                    return {"hex": data.hex()}
+
             def clean_options(items):
                 result = []
                 force = False
@@ -512,16 +530,22 @@ def install_fake_volume_modal(tmp_path: Path, monkeypatch, state: dict) -> Path:
                     sys.exit(2)
                 root = Path(destination)
                 root.mkdir(parents=True, exist_ok=True)
+                print("fake modal download progress")
+                corrupt = state.get("corrupt_downloads", {}).get(profile + ":" + volume, False)
                 for relative, content in volumes[volume].items():
                     target = root / relative
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_text(content, encoding="utf-8")
+                    data = content_to_bytes(content)
+                    if corrupt:
+                        data += b"corruption"
+                    target.write_bytes(data)
                 sys.exit(0)
             if args[:2] == ["volume", "put"]:
                 volume, local_path, remote_path = args[2:5]
                 if volume not in volumes:
                     print("missing destination volume", file=sys.stderr)
                     sys.exit(2)
+                print("fake modal upload progress")
                 root = Path(local_path)
                 updates = {}
                 for source in root.rglob("*"):
@@ -532,7 +556,7 @@ def install_fake_volume_modal(tmp_path: Path, monkeypatch, state: dict) -> Path:
                         target = relative
                     else:
                         target = (PurePosixPath(remote_path) / relative).as_posix().lstrip("/")
-                    updates[target] = source.read_text(encoding="utf-8")
+                    updates[target] = bytes_to_content(source.read_bytes())
                 if not force:
                     collisions = sorted(set(updates) & set(volumes[volume]))
                     if collisions:
@@ -704,3 +728,348 @@ def test_transfer_verify_redownloads_destination_and_compares_hashes(cockpit, tm
     get_entries = [entry for entry in entries if entry["argv"][:2] == ["volume", "get"]]
     assert len(get_entries) == 2
     assert [entry["profile"] for entry in get_entries] == ["alpha", "beta"]
+
+
+def test_build_exec_environment_scrubbed_transport_overrides(cockpit, monkeypatch):
+    cockpit.add_token_account("alpha", profile=None, token_id="ak-alpha", token_secret="as-alpha", activate=True)
+    for name in ("MODAL_ENVIRONMENT", "MODAL_SERVER_URL", "MODAL_STREAMS_URL", "MODAL_OVERRIDE_HEADERS", "MODAL_DISABLE_API_PROXY"):
+        monkeypatch.setenv(name, "unsafe-override")
+
+    env = cockpit.build_exec_environment("alpha")
+
+    for name in ("MODAL_ENVIRONMENT", "MODAL_SERVER_URL", "MODAL_STREAMS_URL", "MODAL_OVERRIDE_HEADERS", "MODAL_DISABLE_API_PROXY"):
+        assert name not in env
+
+
+def test_remove_account_does_not_require_decrypting_corrupted_snapshot(cockpit):
+    cockpit.add_token_account("alpha", profile=None, token_id="ak-alpha", token_secret="as-alpha", activate=True)
+    account_path = cockpit.store.account_path("alpha")
+    account_path.write_text("corrupted", encoding="utf-8")
+
+    result = cockpit.remove_account("alpha")
+
+    assert result["alias"] == "alpha"
+    assert "alpha" not in cockpit.store.load_index()["accounts"]
+
+
+def test_list_accounts_survives_broken_modal_config(cockpit):
+    cockpit.add_token_account("alpha", profile=None, token_id="ak-alpha", token_secret="as-alpha", activate=True)
+    cockpit.config_path.write_text("broken = [", encoding="utf-8")
+
+    data = cockpit.list_accounts()
+
+    assert data["active_error"] is not None
+    assert data["accounts"][0]["alias"] == "alpha"
+    assert data["accounts"][0]["present_in_config"] is False
+
+
+def test_transfer_binary_zero_byte_and_hidden_files_round_trip(cockpit, tmp_path: Path, monkeypatch):
+    seed_transfer_accounts(cockpit)
+    state_path = install_fake_volume_modal(
+        tmp_path,
+        monkeypatch,
+        {
+            "profiles": {
+                "alpha": {
+                    "volumes": {
+                        "data": {
+                            "binary.bin": {"hex": "000102fffe80"},
+                            "empty": "",
+                            ".hidden": "secret",
+                            "nested/.hidden2": {"hex": "00ff"},
+                        }
+                    }
+                },
+                "beta": {"volumes": {}},
+            }
+        },
+    )
+
+    result = cockpit.transfer_volume("alpha", "beta", "data", verify=True)
+
+    assert result["files"] == 4
+    assert result["verified"] is True
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    copied = state["profiles"]["beta"]["volumes"]["data"]
+    assert copied["binary.bin"] == {"hex": "000102fffe80"}
+    assert copied["empty"] == ""
+    assert copied[".hidden"] == "secret"
+    assert copied["nested/.hidden2"] == {"hex": "00ff"}
+
+
+def test_transfer_empty_volume_creates_destination_without_upload(cockpit, tmp_path: Path, monkeypatch):
+    seed_transfer_accounts(cockpit)
+    state_path = install_fake_volume_modal(
+        tmp_path,
+        monkeypatch,
+        {"profiles": {"alpha": {"volumes": {"empty": {}}}, "beta": {"volumes": {}}}},
+    )
+
+    result = cockpit.transfer_volume("alpha", "beta", "empty")
+
+    assert result["files"] == 0
+    assert result["created_volume"] is True
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["profiles"]["beta"]["volumes"]["empty"] == {}
+    entries = read_fake_modal_log(tmp_path)
+    assert not [entry for entry in entries if entry["argv"][:2] == ["volume", "put"]]
+
+
+def test_transfer_modal_progress_goes_to_stderr_not_stdout(cockpit, tmp_path: Path, monkeypatch, capfd):
+    seed_transfer_accounts(cockpit)
+    install_fake_volume_modal(
+        tmp_path,
+        monkeypatch,
+        {"profiles": {"alpha": {"volumes": {"data": {"a.txt": "new"}}}, "beta": {"volumes": {}}}},
+    )
+
+    cockpit.transfer_volume("alpha", "beta", "data")
+
+    captured = capfd.readouterr()
+    assert captured.out == ""
+    assert "fake modal download progress" in captured.err
+    assert "fake modal upload progress" in captured.err
+
+
+def test_transfer_all_volumes_preflights_later_collision_before_first_copy(cockpit, tmp_path: Path, monkeypatch):
+    seed_transfer_accounts(cockpit)
+    state_path = install_fake_volume_modal(
+        tmp_path,
+        monkeypatch,
+        {
+            "profiles": {
+                "alpha": {"volumes": {"one": {"1": "1"}, "two": {"2": "2"}}},
+                "beta": {"volumes": {"two": {"existing": "collision"}}},
+            }
+        },
+    )
+
+    with pytest.raises(CockpitError, match="уже содержит данные"):
+        cockpit.transfer_volumes("alpha", "beta")
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert "one" not in state["profiles"]["beta"]["volumes"]
+
+
+def test_transfer_all_volumes_error_includes_failed_and_completed_volumes(cockpit, tmp_path: Path, monkeypatch):
+    seed_transfer_accounts(cockpit)
+    install_fake_volume_modal(
+        tmp_path,
+        monkeypatch,
+        {"profiles": {"alpha": {"volumes": {"one": {"1": "1"}, "two": {"2": "2"}}}, "beta": {"volumes": {}}}},
+    )
+    original_transfer = cockpit.transfer_volume
+
+    def fail_second(*args, **kwargs):
+        if args[2] == "two":
+            raise ExternalCommandError("injected upload failure")
+        return original_transfer(*args, **kwargs)
+
+    monkeypatch.setattr(cockpit, "transfer_volume", fail_second)
+
+    with pytest.raises(CockpitError) as excinfo:
+        cockpit.transfer_volumes("alpha", "beta")
+
+    message = str(excinfo.value)
+    assert "'two'" in message
+    assert "1/2" in message
+    assert "one" in message
+
+
+def test_list_volume_names_fails_closed_on_malformed_json(cockpit, monkeypatch):
+    seed_transfer_accounts(cockpit)
+
+    class Completed:
+        stdout = "not-json"
+
+    monkeypatch.setattr(cockpit, "_run_modal", lambda *args, **kwargs: Completed())
+    with pytest.raises(ExternalCommandError, match="некорректный JSON"):
+        cockpit.list_volume_names("alpha")
+
+    class BadRows:
+        stdout = '[{"no_name": "x"}]'
+
+    monkeypatch.setattr(cockpit, "_run_modal", lambda *args, **kwargs: BadRows())
+    with pytest.raises(ExternalCommandError, match="неожиданную строку JSON"):
+        cockpit.list_volume_names("alpha")
+
+
+def test_transfer_custom_staging_dir_is_used_and_cleaned(cockpit, tmp_path: Path, monkeypatch):
+    seed_transfer_accounts(cockpit)
+    install_fake_volume_modal(
+        tmp_path,
+        monkeypatch,
+        {"profiles": {"alpha": {"volumes": {"data": {"a.txt": "new"}}}, "beta": {"volumes": {}}}},
+    )
+    staging_parent = tmp_path / "large-disk"
+
+    cockpit.transfer_volume("alpha", "beta", "data", staging_parent=staging_parent)
+
+    assert staging_parent.exists()
+    assert not list(staging_parent.glob("volume-transfer-*"))
+    assert not list(staging_parent.glob("volume-verify-*"))
+
+
+def test_login_environment_scrubs_credential_and_transport_overrides(cockpit, tmp_path: Path, monkeypatch):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    marker = tmp_path / "login-env.json"
+    fake_modal = bin_dir / "modal"
+    fake_modal.write_text(
+        textwrap.dedent(
+            '''\
+            #!/usr/bin/env python3
+            import json, os, sys
+            names = [
+                "MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET", "MODAL_ENVIRONMENT",
+                "MODAL_SERVER_URL", "MODAL_STREAMS_URL", "MODAL_OVERRIDE_HEADERS", "MODAL_DISABLE_API_PROXY",
+            ]
+            with open(os.environ["FAKE_MODAL_ENV_MARKER"], "w", encoding="utf-8") as marker_file:
+                json.dump({name: bool(os.environ.get(name)) for name in names}, marker_file)
+            with open(os.environ["MODAL_CONFIG_PATH"], "a", encoding="utf-8") as config_file:
+                config_file.write('token_id = "ak-login"\\n')
+                config_file.write('token_secret = "as-login"\\n')
+            sys.exit(0)
+            '''
+        ),
+        encoding="utf-8",
+    )
+    fake_modal.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("FAKE_MODAL_ENV_MARKER", str(marker))
+    monkeypatch.setenv("MODAL_TOKEN_ID", "ak-env")
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", "as-env")
+    monkeypatch.setenv("MODAL_ENVIRONMENT", "wrong-env")
+    monkeypatch.setenv("MODAL_SERVER_URL", "https://wrong.example")
+
+    cockpit.login_with_modal_cli("beta")
+
+    env_flags = json.loads(marker.read_text(encoding="utf-8"))
+    assert not any(env_flags.values())
+
+
+def test_toml_datetime_values_round_trip_through_encrypted_snapshot(cockpit, tmp_path: Path):
+    cockpit.config_path.write_text(
+        textwrap.dedent(
+            '''\
+            [alpha]
+            token_id = "ak-alpha"
+            token_secret = "as-alpha"
+            custom_time = 2024-01-01T00:00:00Z
+            custom_date = 2024-01-02
+            active = true
+            '''
+        ),
+        encoding="utf-8",
+    )
+    cockpit.capture("alpha")
+    cockpit.add_token_account("beta", profile=None, token_id="ak-beta", token_secret="as-beta", activate=True)
+    cockpit.config_path.write_text(
+        cockpit.config_path.read_text(encoding="utf-8").replace('custom_time = 2024-01-01T00:00:00Z\n', ''),
+        encoding="utf-8",
+    )
+
+    result = cockpit.switch("alpha", force_snapshot=True)
+
+    assert result.changed is True
+    data = read_toml(tmp_path / ".modal.toml")
+    assert data["alpha"]["custom_time"].isoformat() == "2024-01-01T00:00:00+00:00"
+    assert data["alpha"]["custom_date"].isoformat() == "2024-01-02"
+
+
+def test_cli_transfer_json_stdout_is_machine_parseable(cockpit, tmp_path: Path, monkeypatch, capfd):
+    from modal_cockpit.cli import main
+
+    seed_transfer_accounts(cockpit)
+    install_fake_volume_modal(
+        tmp_path,
+        monkeypatch,
+        {"profiles": {"alpha": {"volumes": {"data": {"a.txt": "new"}}}, "beta": {"volumes": {}}}},
+    )
+
+    rc = main([
+        "--home", str(cockpit.store.root),
+        "--config-path", str(cockpit.config_path),
+        "transfer", "alpha", "beta", "data", "--yes", "--json", "--verify",
+    ])
+
+    captured = capfd.readouterr()
+    assert rc == 0
+    payload = json.loads(captured.out)
+    assert payload["total_volumes"] == 1
+    assert payload["volumes"][0]["verified"] is True
+    assert "fake modal download progress" in captured.err
+    assert "fake modal upload progress" in captured.err
+
+
+def test_corrupted_backup_is_reported_without_crashing_backup_listing(cockpit):
+    cockpit.add_token_account("alpha", profile=None, token_id="ak-alpha", token_secret="as-alpha", activate=True)
+    backup_id = cockpit.backup_now()
+    backup_path = cockpit.store.backups_dir / backup_id
+    envelope = json.loads(backup_path.read_text(encoding="utf-8"))
+    envelope["ciphertext"] = envelope["ciphertext"][:-8] + "AAAA"
+    backup_path.write_text(json.dumps(envelope), encoding="utf-8")
+
+    backups = cockpit.store.list_backups()
+
+    assert backups[0]["id"] == backup_id
+    assert "error" in backups[0]
+
+
+def test_corrupted_account_fails_switch_but_can_be_removed(cockpit):
+    cockpit.add_token_account("alpha", profile=None, token_id="ak-alpha", token_secret="as-alpha", activate=True)
+    cockpit.store.account_path("alpha").write_text("not-json", encoding="utf-8")
+
+    with pytest.raises(CockpitError):
+        cockpit.switch("alpha")
+
+    cockpit.remove_account("alpha")
+    assert cockpit.store.load_index()["accounts"] == {}
+
+
+def test_corrupted_index_fails_closed(cockpit):
+    cockpit.add_token_account("alpha", profile=None, token_id="ak-alpha", token_secret="as-alpha", activate=True)
+    cockpit.store.index_path.write_text("not-json", encoding="utf-8")
+
+    with pytest.raises(StoreError):
+        cockpit.list_accounts()
+
+
+def test_doctor_reports_stale_plaintext_transfer_directories(cockpit):
+    cockpit.add_token_account("alpha", profile=None, token_id="ak-alpha", token_secret="as-alpha", activate=True)
+    stale = cockpit.store.root / "tmp" / "volume-transfer-stale"
+    stale.mkdir(parents=True)
+    (stale / "plain.txt").write_text("plaintext", encoding="utf-8")
+
+    checks = cockpit.doctor()
+
+    temporary = [item for item in checks if item["name"] == "temporary-files"]
+    assert temporary and temporary[0]["level"] == "warn"
+
+
+def test_transfer_verify_detects_destination_download_mismatch(cockpit, tmp_path: Path, monkeypatch):
+    seed_transfer_accounts(cockpit)
+    state_path = install_fake_volume_modal(
+        tmp_path,
+        monkeypatch,
+        {
+            "profiles": {"alpha": {"volumes": {"data": {"a.txt": "hello"}}}, "beta": {"volumes": {}}},
+            "corrupt_downloads": {"beta:data": True},
+        },
+    )
+
+    with pytest.raises(CockpitError, match="verification failed"):
+        cockpit.transfer_volume("alpha", "beta", "data", verify=True)
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["profiles"]["beta"]["volumes"]["data"]["a.txt"] == "hello"
+
+
+def test_package_version_matches_project_metadata():
+    import tomllib
+
+    import modal_cockpit
+
+    project = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert modal_cockpit.__version__ == project["project"]["version"]

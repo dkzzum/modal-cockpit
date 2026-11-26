@@ -5,7 +5,7 @@ import hashlib
 import json
 import re
 import unicodedata
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, time
 from pathlib import Path
 from typing import Any
 
@@ -18,8 +18,46 @@ ACCOUNT_KIND = "modal-profile"
 BACKUP_KIND = "modal-config-backup"
 
 
+TOML_TYPE_KEY = "__modal_cockpit_toml_type__"
+TOML_VALUE_KEY = "value"
+
+
+def encode_json_value(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return {TOML_TYPE_KEY: "datetime", TOML_VALUE_KEY: value.isoformat()}
+    if isinstance(value, date):
+        return {TOML_TYPE_KEY: "date", TOML_VALUE_KEY: value.isoformat()}
+    if isinstance(value, time):
+        return {TOML_TYPE_KEY: "time", TOML_VALUE_KEY: value.isoformat()}
+    if isinstance(value, dict):
+        return {str(key): encode_json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [encode_json_value(item) for item in value]
+    return value
+
+
+def decode_json_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        if set(value) == {TOML_TYPE_KEY, TOML_VALUE_KEY}:
+            type_name = value[TOML_TYPE_KEY]
+            encoded = value[TOML_VALUE_KEY]
+            try:
+                if type_name == "datetime" and isinstance(encoded, str):
+                    return datetime.fromisoformat(encoded)
+                if type_name == "date" and isinstance(encoded, str):
+                    return date.fromisoformat(encoded)
+                if type_name == "time" and isinstance(encoded, str):
+                    return time.fromisoformat(encoded)
+            except ValueError:
+                pass
+        return {key: decode_json_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [decode_json_value(item) for item in value]
+    return value
+
+
 def canonical_json_bytes(value: Any) -> bytes:
-    return (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    return (json.dumps(encode_json_value(value), ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
 
 
 def validate_name(value: str, *, label: str) -> str:
@@ -49,7 +87,7 @@ def fingerprint(value: Any) -> str | None:
 def auth_type(section: dict[str, Any]) -> str:
     if section.get("token_id") or section.get("token_secret"):
         return "token"
-    if section.get("oauth_refresh_token") or section.get("oauth_client_id") or section.get("oauth_jwt_key"):
+    if section.get("oauth_refresh_token") or section.get("oauth_client_id") or section.get("oauth_client_secret") or section.get("oauth_jwt_key"):
         return "oauth"
     return "settings-only"
 
@@ -179,7 +217,7 @@ class Store:
             raise StoreError(f"аккаунт {alias!r} не найден в modal-cockpit")
         try:
             plaintext = self.cipher.decrypt(path.read_text(encoding="utf-8"), expected_kind=ACCOUNT_KIND)
-            payload = json.loads(plaintext.decode("utf-8"))
+            payload = decode_json_value(json.loads(plaintext.decode("utf-8")))
         except CryptoError:
             raise
         except Exception as exc:
