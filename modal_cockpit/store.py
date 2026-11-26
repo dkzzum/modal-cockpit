@@ -22,6 +22,9 @@ TOML_TYPE_KEY = "__modal_cockpit_toml_type__"
 TOML_VALUE_KEY = "value"
 
 
+ESCAPED_DICT_TYPE = "escaped-dict"
+
+
 def encode_json_value(value: Any) -> Any:
     if isinstance(value, datetime):
         return {TOML_TYPE_KEY: "datetime", TOML_VALUE_KEY: value.isoformat()}
@@ -30,17 +33,24 @@ def encode_json_value(value: Any) -> Any:
     if isinstance(value, time):
         return {TOML_TYPE_KEY: "time", TOML_VALUE_KEY: value.isoformat()}
     if isinstance(value, dict):
-        return {str(key): encode_json_value(item) for key, item in value.items()}
+        encoded_dict = {str(key): encode_json_value(item) for key, item in value.items()}
+        if set(encoded_dict) == {TOML_TYPE_KEY, TOML_VALUE_KEY}:
+            return {TOML_TYPE_KEY: ESCAPED_DICT_TYPE, TOML_VALUE_KEY: encoded_dict}
+        return encoded_dict
     if isinstance(value, (list, tuple)):
         return [encode_json_value(item) for item in value]
     return value
 
 
-def decode_json_value(value: Any) -> Any:
+def decode_json_value(value: Any, *, preserve_tag_shape: bool = False) -> Any:
     if isinstance(value, dict):
         if set(value) == {TOML_TYPE_KEY, TOML_VALUE_KEY}:
             type_name = value[TOML_TYPE_KEY]
             encoded = value[TOML_VALUE_KEY]
+            if preserve_tag_shape:
+                return {key: decode_json_value(item) for key, item in value.items()}
+            if type_name == ESCAPED_DICT_TYPE and isinstance(encoded, dict):
+                return decode_json_value(encoded, preserve_tag_shape=True)
             try:
                 if type_name == "datetime" and isinstance(encoded, str):
                     return datetime.fromisoformat(encoded)
@@ -190,7 +200,7 @@ class Store:
         if mark_switched:
             last_switched_at = now
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "alias": alias,
             "modal_profile": modal_profile,
             "section": copy.deepcopy(section),
@@ -226,9 +236,10 @@ class Store:
             raise
         except Exception as exc:
             raise StoreError(f"не удалось разобрать зашифрованный аккаунт {alias!r}") from exc
+        if not isinstance(payload, dict) or payload.get("schema_version") not in (1, 2):
+            raise StoreError(f"зашифрованный аккаунт {alias!r} имеет неподдерживаемую версию")
         if (
-            not isinstance(payload, dict)
-            or payload.get("alias") != alias
+            payload.get("alias") != alias
             or not isinstance(payload.get("modal_profile"), str)
             or not payload.get("modal_profile")
             or not isinstance(payload.get("section"), dict)
@@ -288,7 +299,13 @@ class Store:
             raise
         except Exception as exc:
             raise StoreError(f"backup {backup_id!r} повреждён") from exc
-        if not isinstance(payload, dict) or not isinstance(payload.get("text"), str) or not isinstance(payload.get("sha256"), str):
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version") != 1
+            or not isinstance(payload.get("text"), str)
+            or not isinstance(payload.get("sha256"), str)
+            or not isinstance(payload.get("source_path"), str)
+        ):
             raise StoreError(f"backup {backup_id!r} имеет неверный формат")
         actual = hashlib.sha256(payload["text"].encode("utf-8")).hexdigest()
         if actual != payload["sha256"]:

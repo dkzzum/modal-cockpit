@@ -234,6 +234,14 @@ A fresh backup of the current state is created before restore.
 
 Backups contain the Modal config, but restore intentionally does not roll back the encrypted account snapshots in `accounts/`. This avoids losing newer credentials that may have been captured after the backup was created.
 
+After a restore, automatic snapshot synchronization is suspended: the restored config may contain old credentials, and routine operations (`switch`, `exec`, `transfer`) must not silently copy them back over newer encrypted snapshots. While suspended, operations keep using the stored snapshots as-is. If you deliberately want to accept the restored live credentials into the encrypted snapshots, run:
+
+```bash
+modal-cockpit sync
+```
+
+Explicit snapshot-writing commands (`capture`, `add`, `login`) always write snapshots because they represent deliberate user intent.
+
 If a managed profile section was deleted from the config, a normal `switch` restores it from the encrypted snapshot. If the section exists but is damaged or stale and you intentionally want the snapshot to win:
 
 ```bash

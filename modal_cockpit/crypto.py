@@ -11,6 +11,7 @@ from typing import Any
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from .atomic import _fsync_dir
 from .errors import CryptoError
 
 KEY_ID = "local-file-v1"
@@ -57,6 +58,10 @@ class LocalCipher:
                 os.link(tmp, self.key_path)
             except FileExistsError:
                 pass
+            except OSError as exc:
+                raise CryptoError(f"файловая система не позволяет создать ключ {self.key_path}: {exc}") from exc
+            else:
+                _fsync_dir(self.key_path.parent)
         finally:
             try:
                 tmp.unlink(missing_ok=True)
@@ -74,11 +79,14 @@ class LocalCipher:
         return key
 
     def _load_or_create_key(self) -> bytes:
-        if self._key is not None:
-            return self._key
-        if not self.key_path.exists():
-            self._create_key_file_once(_b64e(secrets.token_bytes(32)))
-        key = self._read_key_file()
+        if self.key_path.exists():
+            key = self._read_key_file()
+            if self._key is not None and self._key != key:
+                raise CryptoError(f"ключ шифрования {self.key_path} изменился во время работы процесса")
+        else:
+            encoded = _b64e(self._key or secrets.token_bytes(32))
+            self._create_key_file_once(encoded)
+            key = self._read_key_file()
         if os.name == "posix":
             os.chmod(self.key_path, 0o600)
         self._key = key

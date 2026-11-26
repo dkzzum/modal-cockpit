@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import tomlkit
-from tomlkit.items import Table
+from tomlkit.items import AbstractTable
 
 from .errors import ConfigError
 
@@ -95,7 +95,7 @@ def section_without_active(section: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _put_value(table: Table, key: str, value: Any) -> None:
+def _put_value(table: AbstractTable, key: str, value: Any) -> None:
     table[key] = copy.deepcopy(value)
 
 
@@ -117,7 +117,7 @@ def upsert_profile_section(
         return
 
     existing = doc[profile]
-    if not isinstance(existing, Table):
+    if not isinstance(existing, AbstractTable):
         raise ConfigError(f"профиль {profile!r} в TOML не является таблицей")
     if replace:
         for key in list(existing.keys()):
@@ -127,10 +127,10 @@ def upsert_profile_section(
 
 
 def set_only_active_profile(doc: tomlkit.TOMLDocument, profile: str) -> None:
-    if profile not in doc or not isinstance(doc[profile], Table):
+    if profile not in doc or not isinstance(doc[profile], AbstractTable):
         raise ConfigError(f"профиль {profile!r} отсутствует в Modal config")
     for item in doc.values():
-        if isinstance(item, Table) and "active" in item:
+        if isinstance(item, AbstractTable) and "active" in item:
             del item["active"]
     doc[profile]["active"] = True  # type: ignore[index]
 

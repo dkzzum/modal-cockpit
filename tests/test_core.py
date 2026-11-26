@@ -1200,3 +1200,90 @@ def test_partial_auth_import_and_corrupt_snapshot_fail_before_config_write(cockp
     with pytest.raises(CryptoError):
         cockpit.add_token_account("alpha", profile=None, token_id="ak-new", token_secret="as-new")
     assert cockpit.config_path.read_text(encoding="utf-8") == before
+
+
+def test_settings_only_or_damaged_live_auth_does_not_erase_credentialed_snapshot(cockpit):
+    cockpit.add_token_account("alpha", profile=None, token_id="ak-alpha", token_secret="as-alpha", activate=True)
+    original = cockpit.config_path.read_text(encoding="utf-8")
+    damaged = original.replace('token_secret = "as-alpha"\n', '')
+    cockpit.config_path.write_text(damaged, encoding="utf-8")
+    cockpit.ensure_profile_present("alpha")
+    assert cockpit.store.load_account("alpha")["section"]["token_secret"] == "as-alpha"
+    cockpit.config_path.write_text(original.replace('token_id = "ak-alpha"\n', '').replace('token_secret = "as-alpha"\n', ''), encoding="utf-8")
+    cockpit.ensure_profile_present("alpha")
+    assert cockpit.store.load_account("alpha")["section"]["token_id"] == "ak-alpha"
+
+
+def test_reserved_type_tag_shaped_user_table_survives_snapshot(cockpit):
+    cockpit.config_path.write_text(
+        '[alpha]\ntoken_id="ak"\ntoken_secret="as"\nactive=true\n[alpha.metadata]\n__modal_cockpit_toml_type__="date"\nvalue="2024-01-01"\n',
+        encoding="utf-8",
+    )
+    cockpit.capture("alpha")
+    assert isinstance(cockpit.store.load_account("alpha")["section"]["metadata"], dict)
+
+
+def test_inline_table_profile_can_switch(cockpit):
+    cockpit.config_path.write_text('alpha = { token_id = "ak", token_secret = "as", active = true }\n', encoding="utf-8")
+    cockpit.capture("alpha")
+    result = cockpit.switch("alpha")
+    assert result.modal_profile == "alpha"
+
+
+def test_streaming_modal_output_redacts_token_like_and_exact_secret(cockpit, tmp_path: Path, monkeypatch, capfd):
+    cockpit.add_token_account("alpha", profile=None, token_id="ak-alpha-secret", token_secret="as-alpha-secret", activate=True)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    modal = bin_dir / "modal"
+    modal.write_text('#!/bin/sh\necho "ak-alpha-secret as-alpha-secret" >&2\nexit 3\n', encoding="utf-8")
+    modal.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ["PATH"])
+
+    with pytest.raises(ExternalCommandError):
+        cockpit._run_modal("alpha", ["volume", "get"])
+
+    captured = capfd.readouterr()
+    assert "ak-alpha-secret" not in captured.err
+    assert "as-alpha-secret" not in captured.err
+    assert "[redacted]" in captured.err
+
+
+def test_transfer_journal_removed_after_success_and_failure(cockpit, monkeypatch, tmp_path: Path):
+    seed_transfer_accounts(cockpit)
+    install_fake_volume_modal(
+        tmp_path,
+        monkeypatch,
+        {"profiles": {"alpha": {"volumes": {"vol1": {"a.txt": "hello"}}}, "beta": {"volumes": {}}}},
+    )
+    tmp_dir = cockpit.store.root / "tmp"
+
+    cockpit.transfer_volume("alpha", "beta", "vol1")
+    assert not list(tmp_dir.glob("transfer-journal-*.json"))
+
+    monkeypatch.setattr(ModalCockpit, "_inspect_staging_tree", staticmethod(lambda *a, **k: (_ for _ in ()).throw(CockpitError("boom"))))
+    with pytest.raises(CockpitError):
+        cockpit.transfer_volume("alpha", "beta", "vol1", force=True)
+    assert not list(tmp_dir.glob("transfer-journal-*.json"))
+
+
+def test_doctor_detects_orphaned_transfer_journal(cockpit, tmp_path: Path):
+    parent = tmp_path / "staging"
+    parent.mkdir()
+    (parent / "volume-transfer-leftover").mkdir()
+    journal = {
+        "schema_version": 1,
+        "phase": "transfer",
+        "volume": "vol1",
+        "staging_parent": str(parent),
+        "pid": 99999999,
+        "created_at": "2024-01-01T00:00:00Z",
+    }
+    tmp_dir = cockpit.store.root / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    (tmp_dir / "transfer-journal-99999999-deadbeef.json").write_text(json.dumps(journal), encoding="utf-8")
+
+    checks = cockpit.doctor()
+    journal_checks = [c for c in checks if c["name"] == "transfer-journal"]
+    assert journal_checks
+    assert journal_checks[0]["level"] == "warn"
+    assert "volume-transfer-leftover" in journal_checks[0]["message"]

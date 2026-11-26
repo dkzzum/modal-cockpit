@@ -19,6 +19,7 @@ from typing import Any
 import tomlkit
 
 from .atomic import ensure_private_dir, exclusive_lock, write_text_atomic
+from .crypto import utc_now
 from .errors import CockpitError, ConfigError, ExternalCommandError, StoreError
 from .store import Store, validate_name
 from .toml_config import (
@@ -100,6 +101,18 @@ class ModalCockpit:
             )
         self._write_config(text)
 
+    def _should_sync_live_section(self, alias: str, live: dict[str, Any]) -> bool:
+        try:
+            self._validate_auth_section(live)
+        except StoreError:
+            return False
+        live_has_auth = any(key in live for key in AUTH_CONFIG_KEYS)
+        if live_has_auth:
+            return True
+        existing = self.store.load_account(alias)
+        existing_has_auth = any(key in existing["section"] for key in AUTH_CONFIG_KEYS)
+        return not existing_has_auth
+
     def _sync_managed_from_data_locked(
         self,
         data: dict[str, dict[str, Any]],
@@ -116,9 +129,7 @@ class ModalCockpit:
             profile = meta.get("modal_profile")
             if isinstance(profile, str) and profile in data:
                 live = section_without_active(data[profile])
-                try:
-                    self._validate_auth_section(live)
-                except StoreError:
+                if not self._should_sync_live_section(alias, live):
                     continue
                 self.store.save_account(alias, profile, live)
                 synced.append(alias)
@@ -295,7 +306,9 @@ class ModalCockpit:
             ensure_no_multiple_active(cfg.data)
             protected = self.store.load_index().get("restore_protection")
             if modal_profile in cfg.data and not protected:
-                self.store.save_account(alias, modal_profile, section_without_active(cfg.data[modal_profile]))
+                live = section_without_active(cfg.data[modal_profile])
+                if self._should_sync_live_section(alias, live):
+                    self.store.save_account(alias, modal_profile, live)
                 return False
             if modal_profile in cfg.data and section_without_active(cfg.data[modal_profile]) == account["section"]:
                 return False
@@ -339,6 +352,17 @@ class ModalCockpit:
             modal_profile = metadata.get("modal_profile")
             if not isinstance(modal_profile, str):
                 raise StoreError(f"metadata аккаунта {alias!r} повреждена")
+            try:
+                payload_profile = self.store.load_account(alias).get("modal_profile")
+            except CockpitError:
+                if delete_profile:
+                    raise
+            else:
+                if payload_profile != modal_profile:
+                    raise StoreError(
+                        f"metadata и encrypted snapshot аккаунта {alias!r} не совпадают; "
+                        "операция удаления остановлена"
+                    )
             backup_id: str | None = None
             removed_profile = False
             if delete_profile:
@@ -447,6 +471,40 @@ class ModalCockpit:
     @staticmethod
     def _redact_modal_output(text: str) -> str:
         return re.sub(r"\b(?:ak|as)-[A-Za-z0-9_-]+\b", "[redacted]", text)
+
+    def _redact_modal_output_for_alias(self, text: str, alias: str) -> str:
+        redacted = self._redact_modal_output(text)
+        try:
+            section = self.store.load_account(alias)["section"]
+        except CockpitError:
+            section = {}
+        secrets = sorted(
+            (value for key in AUTH_CONFIG_KEYS if isinstance((value := section.get(key)), str) and len(value) >= 6),
+            key=len,
+            reverse=True,
+        )
+        for secret in secrets:
+            redacted = redacted.replace(secret, "[redacted]")
+        return redacted
+
+    def _redact_bytes_for_alias(self, data: bytes, alias: str) -> bytes:
+        return self._redact_modal_output_for_alias(data.decode("utf-8", errors="replace"), alias).encode("utf-8")
+
+    def _run_modal_streaming_redacted(self, command: list[str], env: dict[str, str], alias: str) -> int:
+        process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        assert process.stdout is not None
+        pending = b""
+        while True:
+            chunk = process.stdout.read1(4096)
+            if not chunk:
+                break
+            pending += chunk
+            if len(pending) > 4096:
+                emit, pending = pending[:-256], pending[-256:]
+                os.write(2, self._redact_bytes_for_alias(emit, alias))
+        if pending:
+            os.write(2, self._redact_bytes_for_alias(pending, alias))
+        return process.wait()
 
     @staticmethod
     def _environment_args(environment: str | None) -> list[str]:
@@ -557,6 +615,21 @@ class ModalCockpit:
                 f"download volume {volume!r} incomplete: размеры не совпадают у " + ", ".join(mismatched[:5])
             )
 
+    def _write_transfer_journal(self, staging_parent: Path, *, volume: str, phase: str) -> Path:
+        journal_dir = self.store.root / "tmp"
+        ensure_private_dir(journal_dir)
+        journal = journal_dir / f"transfer-journal-{os.getpid()}-{secrets.token_hex(6)}.json"
+        payload = {
+            "schema_version": 1,
+            "phase": phase,
+            "volume": volume,
+            "staging_parent": str(staging_parent),
+            "pid": os.getpid(),
+            "created_at": utc_now(),
+        }
+        write_text_atomic(journal, json.dumps(payload, ensure_ascii=False, indent=2) + "\n", mode=0o600)
+        return journal
+
     @staticmethod
     def validate_destination_volume_name(volume: str) -> str:
         volume = validate_name(volume, label="имя destination Modal volume")
@@ -592,14 +665,15 @@ class ModalCockpit:
                     errors="replace",
                 )
             else:
-                completed = subprocess.run(command, env=env, check=False, stdout=2)
+                returncode = self._run_modal_streaming_redacted(command, env, alias)
+                completed = subprocess.CompletedProcess(command, returncode, stdout="", stderr="")
         except OSError as exc:
             raise ExternalCommandError(f"не удалось запустить Modal CLI {modal!r}: {exc}") from exc
         if completed.returncode != 0:
             operation = " ".join(args[:2]) or "command"
             detail = ""
             if capture_output:
-                combined = self._redact_modal_output((completed.stderr or "") + "\n" + (completed.stdout or "")).strip()
+                combined = self._redact_modal_output_for_alias((completed.stderr or "") + "\n" + (completed.stdout or ""), alias).strip()
                 if combined:
                     detail = ": " + combined[-1200:]
             else:
@@ -810,92 +884,96 @@ class ModalCockpit:
             if not parent.is_dir():
                 raise CockpitError(f"staging parent не является директорией: {parent}")
 
-        with tempfile.TemporaryDirectory(prefix="volume-transfer-", dir=parent) as temp_dir:
-            staging = Path(temp_dir)
-            inventory = self.inventory_volume(
-                source_alias,
-                volume,
-                environment=source_environment,
-                collision_root=staging,
-            )
-            self._run_modal(
-                source_alias,
-                [
-                    "volume",
-                    "get",
-                    *self._environment_args(source_environment),
+        transfer_journal = self._write_transfer_journal(parent, volume=volume, phase="transfer")
+        try:
+            with tempfile.TemporaryDirectory(prefix="volume-transfer-", dir=parent) as temp_dir:
+                staging = Path(temp_dir)
+                inventory = self.inventory_volume(
+                    source_alias,
                     volume,
-                    "/",
-                    str(staging),
-                ],
-            )
-            self._validate_downloaded_inventory(inventory, staging, volume=volume)
-            files, byte_count, directories = self._inspect_staging_tree(staging)
-            source_manifest = self._file_manifest(staging, files)
-            if destination_volume not in destination_names:
-                self.create_volume(destination_alias, destination_volume, environment=destination_environment)
-                created_volume = True
-            if files:
-                self._run_modal(
-                    destination_alias,
-                    [
-                        "volume",
-                        "put",
-                        *(["--force"] if force else []),
-                        *self._environment_args(destination_environment),
-                        destination_volume,
-                        str(staging),
-                        "/.",
-                    ],
-                )
-
-        verified = False
-        if verify and files:
-            with tempfile.TemporaryDirectory(prefix="volume-verify-", dir=parent) as verify_dir:
-                verify_staging = Path(verify_dir)
-                self.inventory_volume(
-                    destination_alias,
-                    destination_volume,
-                    environment=destination_environment,
-                    collision_root=verify_staging,
+                    environment=source_environment,
+                    collision_root=staging,
                 )
                 self._run_modal(
-                    destination_alias,
+                    source_alias,
                     [
                         "volume",
                         "get",
-                        *self._environment_args(destination_environment),
-                        destination_volume,
+                        *self._environment_args(source_environment),
+                        volume,
                         "/",
-                        str(verify_staging),
+                        str(staging),
                     ],
                 )
-                verify_files, _, _ = self._inspect_staging_tree(verify_staging)
-                verify_manifest = self._file_manifest(verify_staging, verify_files)
-            mismatches = [
-                relative
-                for relative, expected in source_manifest.items()
-                if verify_manifest.get(relative) != expected
-            ]
-            if mismatches:
-                raise CockpitError(
-                    f"verification failed для {len(mismatches)} файлов; destination не откатывался автоматически"
-                )
-            verified = True
-        elif verify:
-            verified = True
+                self._validate_downloaded_inventory(inventory, staging, volume=volume)
+                files, byte_count, directories = self._inspect_staging_tree(staging)
+                source_manifest = self._file_manifest(staging, files)
+                if destination_volume not in destination_names:
+                    self.create_volume(destination_alias, destination_volume, environment=destination_environment)
+                    created_volume = True
+                if files:
+                    self._run_modal(
+                        destination_alias,
+                        [
+                            "volume",
+                            "put",
+                            *(["--force"] if force else []),
+                            *self._environment_args(destination_environment),
+                            destination_volume,
+                            str(staging),
+                            "/.",
+                        ],
+                    )
 
-        return {
-            "source_account": source_alias,
-            "destination_account": destination_alias,
-            "source_volume": volume,
-            "destination_volume": destination_volume,
-            "created_volume": created_volume,
-            "files": len(files),
-            "directories": directories,
-            "bytes": byte_count,
-            "verified": verified,
-        }
+            verified = False
+            if verify and files:
+                with tempfile.TemporaryDirectory(prefix="volume-verify-", dir=parent) as verify_dir:
+                    verify_staging = Path(verify_dir)
+                    self.inventory_volume(
+                        destination_alias,
+                        destination_volume,
+                        environment=destination_environment,
+                        collision_root=verify_staging,
+                    )
+                    self._run_modal(
+                        destination_alias,
+                        [
+                            "volume",
+                            "get",
+                            *self._environment_args(destination_environment),
+                            destination_volume,
+                            "/",
+                            str(verify_staging),
+                        ],
+                    )
+                    verify_files, _, _ = self._inspect_staging_tree(verify_staging)
+                    verify_manifest = self._file_manifest(verify_staging, verify_files)
+                mismatches = [
+                    relative
+                    for relative, expected in source_manifest.items()
+                    if verify_manifest.get(relative) != expected
+                ]
+                if mismatches:
+                    raise CockpitError(
+                        f"verification failed для {len(mismatches)} файлов; destination не откатывался автоматически"
+                    )
+                verified = True
+            elif verify:
+                verified = True
+
+            return {
+                "source_account": source_alias,
+                "destination_account": destination_alias,
+                "source_volume": volume,
+                "destination_volume": destination_volume,
+                "created_volume": created_volume,
+                "files": len(files),
+                "directories": directories,
+                "bytes": byte_count,
+                "verified": verified,
+            }
+        finally:
+            transfer_journal.unlink(missing_ok=True)
 
     def transfer_volumes(
         self,
@@ -1058,8 +1136,30 @@ class ModalCockpit:
         def add(level: str, name: str, message: str) -> None:
             checks.append({"level": level, "name": name, "message": message})
 
-        if shutil.which("modal"):
-            add("ok", "modal-cli", f"Modal CLI найден: {shutil.which('modal')}")
+        modal_path = shutil.which("modal")
+        if modal_path:
+            add("ok", "modal-cli", f"Modal CLI найден: {modal_path}")
+            try:
+                version_result = subprocess.run(
+                    [modal_path, "--version"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=10,
+                    check=False,
+                )
+                match = re.search(r"(\d+)\.(\d+)\.(\d+)", version_result.stdout + version_result.stderr)
+                if match and version_result.returncode == 0:
+                    version = tuple(int(part) for part in match.groups())
+                    if version >= (1, 6, 0):
+                        add("ok", "modal-cli-version", f"Modal CLI version: {'.'.join(match.groups())}")
+                    else:
+                        add("warn", "modal-cli-version", f"Modal CLI {'.'.join(match.groups())} старше рекомендуемого 1.6.x")
+                else:
+                    add("warn", "modal-cli-version", "не удалось определить версию Modal CLI")
+            except Exception as exc:  # noqa: BLE001
+                add("warn", "modal-cli-version", f"не удалось определить версию Modal CLI: {exc}")
         else:
             add("warn", "modal-cli", "Modal CLI не найден в PATH; ядро переключения всё равно работает")
 
@@ -1130,6 +1230,48 @@ class ModalCockpit:
                     )
                 else:
                     add("ok", "temporary-files", "остатков plaintext temporary directories нет")
+            try:
+                journals = sorted(tmp_dir.glob("transfer-journal-*.json"))
+            except OSError:
+                journals = []
+            for journal in journals:
+                try:
+                    payload = json.loads(journal.read_text(encoding="utf-8"))
+                    pid = payload.get("pid")
+                    parent = payload.get("staging_parent")
+                except (OSError, ValueError):
+                    add("warn", "transfer-journal", f"повреждённый transfer journal: {journal.name}; удалите вручную")
+                    continue
+                pid_alive = False
+                if isinstance(pid, int) and pid > 0 and os.name == "posix":
+                    try:
+                        os.kill(pid, 0)
+                        pid_alive = True
+                    except ProcessLookupError:
+                        pid_alive = False
+                    except PermissionError:
+                        pid_alive = True
+                    except OSError:
+                        pid_alive = False
+                if pid_alive:
+                    continue
+                leftovers: list[str] = []
+                if isinstance(parent, str) and Path(parent).is_dir():
+                    try:
+                        leftovers = sorted(
+                            path.name
+                            for pattern in ("volume-transfer-*", "volume-verify-*")
+                            for path in Path(parent).glob(pattern)
+                        )
+                    except OSError:
+                        pass
+                detail = f" в {parent}: {', '.join(leftovers[:5])}" if leftovers else ""
+                add(
+                    "warn",
+                    "transfer-journal",
+                    f"обнаружен прерванный transfer (journal {journal.name}){detail}; "
+                    "проверьте и удалите остатки staging и journal вручную",
+                )
 
         if os.environ.get("MODAL_PROFILE"):
             add(
