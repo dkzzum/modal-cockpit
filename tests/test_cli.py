@@ -129,3 +129,18 @@ def test_confirmation_prompt_goes_to_stderr(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "test action" in captured.err
+
+
+def test_exec_keep_env_after_alias_is_parsed(monkeypatch, tmp_path: Path):
+    captured = {}
+
+    def fake_exec(self, alias, command, *, keep_credential_env=False):
+        captured.update(alias=alias, command=command, keep_credential_env=keep_credential_env)
+        return 0
+
+    monkeypatch.setattr(ModalCockpit, "exec", fake_exec)
+    rc = main(base_args(tmp_path) + ["exec", "alpha", "--keep-env", "--", "modal", "app", "list"])
+
+    assert rc == 0
+    assert captured["keep_credential_env"] is True
+    assert captured["command"] == ["modal", "app", "list"]

@@ -84,6 +84,9 @@ class LocalCipher:
         self._key = key
         return key
 
+    def validate_or_create_key(self) -> None:
+        self._load_or_create_key()
+
     @staticmethod
     def _aad(kind: str) -> bytes:
         return f"modal-cockpit:v{VERSION}:{kind}".encode()

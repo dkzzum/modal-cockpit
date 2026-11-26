@@ -58,7 +58,7 @@ For shell pipelines or redirection, use an explicit shell inside `exec` and be
 careful with quoting:
 
 ```bash
-modal-cockpit exec ACCOUNT -- sh -lc 'modal app list | head'
+modal-cockpit exec ACCOUNT -- sh -c 'modal app list | head'
 ```
 
 Prefer several short `exec` commands over changing global account state. This is
@@ -79,8 +79,13 @@ Do not set credential overrides yourself:
 - Modal OAuth token environment variables
 
 Do not pass `--keep-env` to `modal-cockpit exec` unless the user explicitly asks
-for it. The default behavior intentionally strips credential overrides so the
-selected account cannot be accidentally replaced by environment state.
+for it. The default behavior intentionally strips credential overrides plus
+transport overrides (`MODAL_ENVIRONMENT`, `MODAL_SERVER_URL`, `MODAL_STREAMS_URL`,
+`MODAL_OVERRIDE_HEADERS`, `MODAL_DISABLE_API_PROXY`, `MODAL_IS_REMOTE`) and
+terminal-forcing variables that can corrupt machine-readable output. Use explicit
+Modal command options or profile settings instead of relying on inherited values.
+Do not use a login shell such as `sh -lc` inside `exec`; shell startup files can
+reintroduce the overrides that modal-cockpit just removed.
 
 Do not set `MODAL_PROFILE` or `MODAL_CONFIG_PATH` manually for normal Modal
 operations; `modal-cockpit exec` sets the correct values for the subprocess.
@@ -148,8 +153,13 @@ A transfer is copy-first, not mirror and not deletion:
 - `--verify` compares copied files by re-downloading the destination, but it
   does not independently prove the original source download and does not roll
   back failures;
-- only regular files are reliably transferred; empty directories, timestamps,
-  executable bits, symlinks and other special filesystem entries may be omitted.
+- modal-cockpit inventories the volume recursively before download and refuses
+  symlinks, FIFOs, sockets, unsafe path components and local filename collisions;
+  only regular files and directories are accepted;
+- empty directories, timestamps and executable bits are not guaranteed to be
+  preserved;
+- inventory is not a snapshot: writers must be stopped because entries can still
+  change between inventory, download, upload and verification.
 
 Never delete the source volume or otherwise "clean up" the source account after
 a transfer. Even after successful verification, deletion is a separate

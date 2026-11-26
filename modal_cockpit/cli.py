@@ -13,7 +13,12 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .core import CREDENTIAL_ENV_VARS, TRANSPORT_ENV_VARS, ModalCockpit
+from .core import (
+    CREDENTIAL_ENV_VARS,
+    TERMINAL_ENV_VARS,
+    TRANSPORT_ENV_VARS,
+    ModalCockpit,
+)
 from .errors import CockpitError
 from .paths import coerce_path, default_modal_config_path, default_store_home
 
@@ -33,7 +38,10 @@ def read_secret(value: str | None, prompt: str) -> str:
         return sys.stdin.readline().rstrip("\r\n")
     if value is not None:
         return value
-    return getpass.getpass(prompt)
+    try:
+        return getpass.getpass(prompt)
+    except (EOFError, OSError) as exc:
+        raise CockpitError(f"не удалось интерактивно прочитать секрет; используйте '-' для stdin: {exc}") from exc
 
 
 def confirm_or_fail(action: str, yes: bool, subject: str) -> None:
@@ -197,11 +205,15 @@ def cmd_current(args: argparse.Namespace) -> int:
 def cmd_exec(args: argparse.Namespace) -> int:
     cockpit = build_cockpit(args)
     command = list(args.command)
+    keep_env = args.keep_env
+    if command and command[0] == "--keep-env":
+        keep_env = True
+        command = command[1:]
     if command and command[0] == "--":
         command = command[1:]
     if not command:
         raise CockpitError("usage: modal-cockpit exec ACCOUNT -- COMMAND [ARGS...]")
-    return cockpit.exec(args.alias, command, keep_credential_env=args.keep_env)
+    return cockpit.exec(args.alias, command, keep_credential_env=keep_env)
 
 
 def shell_quote(value: str) -> str:
@@ -214,7 +226,7 @@ def cmd_env(args: argparse.Namespace) -> int:
     env = cockpit.build_exec_environment(args.alias, keep_credential_env=args.keep_env)
     print(f"export MODAL_PROFILE={shell_quote(env['MODAL_PROFILE'])}")
     print(f"export MODAL_CONFIG_PATH={shell_quote(env['MODAL_CONFIG_PATH'])}")
-    for name in TRANSPORT_ENV_VARS:
+    for name in TRANSPORT_ENV_VARS + TERMINAL_ENV_VARS:
         print(f"unset {name}")
     if not args.keep_env:
         for name in CREDENTIAL_ENV_VARS:
@@ -243,14 +255,20 @@ def cmd_transfer(args: argparse.Namespace) -> int:
     if args.all_volumes and args.destination_volume:
         raise CockpitError("--dest-volume можно использовать только при переносе одного volume")
 
-    target = "all volumes" if args.all_volumes else f"volume {args.volume}"
+    if args.source_account == args.destination_account and not args.destination_volume:
+        raise CockpitError("source и destination account совпадают; укажите другой аккаунт или --dest-volume")
+    if args.destination_volume:
+        cockpit.validate_destination_volume_name(args.destination_volume)
+    target = "all volumes" if args.all_volumes else f"volume {args.volume} -> {args.destination_volume or args.volume}"
     action = "copy Modal volume data into another account"
     if args.force:
         action += " and overwrite existing destination files"
+    source_env = args.source_env or "default"
+    dest_env = args.dest_env or "default"
     confirm_or_fail(
         action,
         args.yes,
-        f"{args.source_account} -> {args.destination_account}, {target}",
+        f"{args.source_account}(env {source_env}) -> {args.destination_account}(env {dest_env}), {target}, force={args.force}",
     )
     staging_parent = Path(args.staging_dir).expanduser() if args.staging_dir else None
     if args.volume:
@@ -478,6 +496,9 @@ def make_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    if os.name != "posix":
+        print("modal-cockpit: error: currently supported only on POSIX systems", file=sys.stderr)
+        return 2
     parser = make_parser()
     args = parser.parse_args(argv)
     try:

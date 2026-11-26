@@ -192,12 +192,16 @@ modal-cockpit transfer personal work my-volume --verify --yes
 - без `--force` непустой целевой volume останавливает перенос ещё на preflight, до скачивания; `--force` означает merge/overwrite, а не mirror — лишние файлы в destination остаются;
 - все данные временно записываются на локальный диск, поэтому нужно достаточно свободного места. Через `--staging-dir` можно выбрать большой диск;
 - во время переноса данные локально лежат в plaintext; временная директория удаляется после нормального завершения, но может остаться после SIGKILL/отключения питания;
-- переносятся только regular files. Modal CLI может не скачать symlink/special entries в staging вообще; любые такие объекты, обнаруженные локально, останавливают transfer до upload. Пустые директории, timestamps и executable bits не гарантированно сохраняются;
-- копирование живого volume не является snapshot-consistent; сначала остановите писателей. При ошибке upload целевой volume может остаться частично скопированным;
+- перед download source volume рекурсивно инвентаризируется. Symlink, FIFO, socket, absolute/`..` path components и filename collisions на локальной FS останавливают перенос до download. После download проверяются missing files и size mismatch до любого upload в destination. Пустые директории, timestamps и executable bits не гарантированно сохраняются;
+- копирование живого volume не является snapshot-consistent; сначала остановите писателей. Inventory снижает риск silent omission и unsafe paths, но не устраняет race с concurrent writers. При ошибке upload целевой volume может остаться частично скопированным;
 - `--verify` повторно скачивает destination и сравнивает SHA-256 скопированных файлов. Это проверяет upload-сторону, но не может независимо доказать корректность исходного download Modal CLI; проверка увеличивает bandwidth/время и не откатывает failed copy;
 - transfer не обходит биллинговые или access restrictions Modal: исходный аккаунт всё ещё должен иметь возможность читать volume;
 - metadata/backend version volume не копируются; автоматически созданные volumes используют настройки Modal по умолчанию. Проверено с Modal CLI 1.6.4;
 - legacy `modal.NetworkFileSystem` этой командой не поддерживается.
+
+## Поддерживаемые платформы
+
+`modal-cockpit` поддерживает POSIX-системы (Linux и macOS). На non-POSIX системах он fail-closed, а не silently отключает lock и permission checks. На macOS Intel установка pinned `cryptography` может потребовать Rust/native toolchain, потому что современные upstream wheels публикуются только для Apple Silicon.
 
 ## Восстановление и backups
 

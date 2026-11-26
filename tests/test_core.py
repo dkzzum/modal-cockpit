@@ -14,6 +14,7 @@ from modal_cockpit.core import ModalCockpit
 from modal_cockpit.errors import (
     CockpitError,
     ConfigError,
+    CryptoError,
     ExternalCommandError,
     StoreError,
 )
@@ -503,20 +504,29 @@ def install_fake_volume_modal(tmp_path: Path, monkeypatch, state: dict) -> Path:
                 sys.exit(0)
             if args[:2] == ["volume", "ls"]:
                 volume = args[2]
+                list_path = args[3] if len(args) > 3 else "/"
                 if volume not in volumes:
                     print("missing volume", file=sys.stderr)
                     sys.exit(2)
+                prefix = "" if list_path in ("", "/", ".") else list_path.strip("/") + "/"
                 entries = {}
                 for relative, content in volumes[volume].items():
-                    first, *rest = relative.split("/")
+                    if not relative.startswith(prefix):
+                        continue
+                    rest_path = relative[len(prefix):]
+                    if not rest_path:
+                        continue
+                    first, *rest = rest_path.split("/")
+                    full_path = prefix + first
+                    escaped = full_path.encode("unicode_escape").decode("utf-8")
                     if rest:
-                        entries[first] = {"filename": first, "type": "dir", "created_modified": "x", "size": 0}
+                        entries[full_path] = {"filename": escaped, "type": "dir", "created_modified": "x", "size": 0}
                     else:
-                        entries[first] = {
-                            "filename": first,
+                        entries[full_path] = {
+                            "filename": escaped,
                             "type": "file",
                             "created_modified": "x",
-                            "size": len(content),
+                            "size": len(content_to_bytes(content)),
                         }
                 print(json.dumps(list(entries.values())))
                 sys.exit(0)
@@ -858,14 +868,14 @@ def test_transfer_all_volumes_error_includes_failed_and_completed_volumes(cockpi
         monkeypatch,
         {"profiles": {"alpha": {"volumes": {"one": {"1": "1"}, "two": {"2": "2"}}}, "beta": {"volumes": {}}}},
     )
-    original_transfer = cockpit.transfer_volume
+    original_transfer = cockpit._transfer_volume_unlocked
 
     def fail_second(*args, **kwargs):
         if args[2] == "two":
             raise ExternalCommandError("injected upload failure")
         return original_transfer(*args, **kwargs)
 
-    monkeypatch.setattr(cockpit, "transfer_volume", fail_second)
+    monkeypatch.setattr(cockpit, "_transfer_volume_unlocked", fail_second)
 
     with pytest.raises(CockpitError) as excinfo:
         cockpit.transfer_volumes("alpha", "beta")
@@ -1073,3 +1083,87 @@ def test_package_version_matches_project_metadata():
     project = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
 
     assert modal_cockpit.__version__ == project["project"]["version"]
+
+
+def test_inventory_rejects_traversal_and_unsupported_entries(cockpit, tmp_path: Path, monkeypatch):
+    cockpit.add_token_account("alpha", profile=None, token_id="ak-alpha", token_secret="as-alpha", activate=True)
+    monkeypatch.setattr(ModalCockpit, "_filesystem_collision_flags", lambda self, root: (False, False))
+
+    def rows(entries):
+        return [{"filename": path, "type": kind, "size": 1} for path, kind in entries]
+
+    monkeypatch.setattr(cockpit, "list_volume_entries", lambda *a, **k: rows([("../evil", "file")]))
+    with pytest.raises(CockpitError, match="небезопасный"):
+        cockpit.inventory_volume("alpha", "data", collision_root=tmp_path)
+
+    monkeypatch.setattr(cockpit, "list_volume_entries", lambda *a, **k: rows([("link", "link")]))
+    with pytest.raises(CockpitError, match="unsupported entry"):
+        cockpit.inventory_volume("alpha", "data", collision_root=tmp_path)
+
+
+def test_inventory_rejects_case_and_unicode_collisions(cockpit, tmp_path: Path, monkeypatch):
+    cockpit.add_token_account("alpha", profile=None, token_id="ak-alpha", token_secret="as-alpha", activate=True)
+    monkeypatch.setattr(ModalCockpit, "_filesystem_collision_flags", lambda self, root: (True, True))
+    monkeypatch.setattr(
+        cockpit,
+        "list_volume_entries",
+        lambda *a, **k: [
+            {"filename": "Foo.txt", "type": "file", "size": 1},
+            {"filename": "foo.txt", "type": "file", "size": 1},
+        ],
+    )
+
+    with pytest.raises(CockpitError, match="конфликтуют"):
+        cockpit.inventory_volume("alpha", "data", collision_root=tmp_path)
+
+
+def test_invalid_destination_volume_fails_before_any_modal_command(cockpit):
+    cockpit.add_token_account("alpha", profile=None, token_id="ak-alpha", token_secret="as-alpha", activate=True)
+    cockpit.add_token_account("beta", profile=None, token_id="ak-beta", token_secret="as-beta")
+
+    with pytest.raises(CockpitError, match="destination Modal volume"):
+        cockpit.transfer_volume("alpha", "beta", "data", destination_volume="bad/name")
+
+
+def test_duplicate_profile_binding_is_rejected_before_config_mutation(cockpit):
+    cockpit.add_token_account("alpha", profile="shared", token_id="ak-alpha", token_secret="as-alpha", activate=True)
+    before = cockpit.config_path.read_text(encoding="utf-8")
+
+    with pytest.raises(StoreError):
+        cockpit.add_token_account("beta", profile="shared", token_id="ak-beta", token_secret="as-beta")
+
+    assert cockpit.config_path.read_text(encoding="utf-8") == before
+    assert "beta" not in cockpit.store.load_index()["accounts"]
+
+
+def test_corrupt_key_is_rejected_before_first_plaintext_config_write(cockpit):
+    cockpit.store.ensure_layout()
+    cockpit.store.key_path.write_text("not-valid-base64\n", encoding="utf-8")
+
+    with pytest.raises(CryptoError):
+        cockpit.add_token_account("alpha", profile=None, token_id="ak-alpha", token_secret="as-alpha", activate=True)
+
+    assert not cockpit.config_path.exists()
+    assert "alpha" not in cockpit.store.load_index()["accounts"]
+
+
+def test_empty_modal_json_stdout_fails_closed(cockpit, monkeypatch):
+    import subprocess
+
+    cockpit.add_token_account("alpha", profile=None, token_id="ak-alpha", token_secret="as-alpha", activate=True)
+    monkeypatch.setattr(
+        cockpit,
+        "_run_modal",
+        lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout="", stderr=""),
+    )
+
+    with pytest.raises(ExternalCommandError, match="пустой stdout"):
+        cockpit.list_volume_names("alpha")
+
+
+def test_valid_json_but_semantically_corrupt_index_fails_closed(cockpit):
+    cockpit.add_token_account("alpha", profile=None, token_id="ak-alpha", token_secret="as-alpha", activate=True)
+    cockpit.store.index_path.write_text('{"version":1,"current_account":null,"accounts":{"alpha":"bad"}}\n', encoding="utf-8")
+
+    with pytest.raises(StoreError):
+        cockpit.list_accounts()

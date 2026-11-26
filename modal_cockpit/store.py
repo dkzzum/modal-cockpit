@@ -123,6 +123,9 @@ class Store:
             raise StoreError(f"не удалось прочитать индекс аккаунтов {self.index_path}: {exc}") from exc
         if not isinstance(data, dict) or data.get("version") != INDEX_VERSION or not isinstance(data.get("accounts"), dict):
             raise StoreError(f"индекс аккаунтов {self.index_path} повреждён или имеет неподдерживаемую версию")
+        for alias, meta in data["accounts"].items():
+            if not isinstance(alias, str) or not isinstance(meta, dict) or not isinstance(meta.get("modal_profile"), str) or not isinstance(meta.get("file"), str):
+                raise StoreError(f"индекс аккаунтов {self.index_path} содержит повреждённую metadata")
         data.setdefault("current_account", None)
         return data
 
@@ -222,7 +225,13 @@ class Store:
             raise
         except Exception as exc:
             raise StoreError(f"не удалось разобрать зашифрованный аккаунт {alias!r}") from exc
-        if not isinstance(payload, dict) or payload.get("alias") != alias or not isinstance(payload.get("section"), dict):
+        if (
+            not isinstance(payload, dict)
+            or payload.get("alias") != alias
+            or not isinstance(payload.get("modal_profile"), str)
+            or not payload.get("modal_profile")
+            or not isinstance(payload.get("section"), dict)
+        ):
             raise StoreError(f"зашифрованный аккаунт {alias!r} повреждён")
         return payload
 

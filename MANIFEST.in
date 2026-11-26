@@ -1,0 +1,5 @@
+include README.ru.md
+include AGENTS.md
+include SECURITY.md
+include LICENSE
+recursive-include tests *.py

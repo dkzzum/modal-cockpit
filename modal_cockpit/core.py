@@ -5,10 +5,12 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import stat
 import subprocess
 import tempfile
+import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,7 +18,7 @@ from typing import Any
 
 import tomlkit
 
-from .atomic import ensure_private_dir, write_text_atomic
+from .atomic import ensure_private_dir, exclusive_lock, write_text_atomic
 from .errors import CockpitError, ConfigError, ExternalCommandError, StoreError
 from .store import Store, validate_name
 from .toml_config import (
@@ -47,6 +49,12 @@ TRANSPORT_ENV_VARS = (
     "MODAL_STREAMS_URL",
     "MODAL_OVERRIDE_HEADERS",
     "MODAL_DISABLE_API_PROXY",
+    "MODAL_IS_REMOTE",
+)
+TERMINAL_ENV_VARS = (
+    "FORCE_COLOR",
+    "FORCE_TERMINAL",
+    "TTY_COMPATIBLE",
 )
 OAUTH_CONFIG_KEYS = (
     "oauth_refresh_token",
@@ -171,6 +179,8 @@ class ModalCockpit:
                 raise StoreError(
                     f"аккаунт {alias!r} уже привязан к профилю {existing_meta.get('modal_profile')!r}"
                 )
+            self.store._validate_unique_profile(alias, profile)
+            self.store.cipher.validate_or_create_key()
             cfg = self._load_config()
             ensure_no_multiple_active(cfg.data)
             backup_id = self._backup_if_exists(cfg, reason)
@@ -382,7 +392,7 @@ class ModalCockpit:
         env = os.environ.copy()
         env["MODAL_PROFILE"] = account["modal_profile"]
         env["MODAL_CONFIG_PATH"] = str(self.config_path)
-        for name in TRANSPORT_ENV_VARS:
+        for name in TRANSPORT_ENV_VARS + TERMINAL_ENV_VARS:
             env.pop(name, None)
         if not keep_credential_env:
             for name in CREDENTIAL_ENV_VARS:
@@ -410,6 +420,121 @@ class ModalCockpit:
     def _environment_args(environment: str | None) -> list[str]:
         return ["-e", environment] if environment else []
 
+    @staticmethod
+    def _decode_modal_ls_path(value: str) -> str:
+        try:
+            return value.encode("utf-8").decode("unicode_escape")
+        except UnicodeError as exc:
+            raise ExternalCommandError("modal volume ls вернул некорректно escaped filename") from exc
+
+    @staticmethod
+    def _validate_remote_volume_path(path: str) -> None:
+        if not path or path.startswith("/") or "\x00" in path:
+            raise CockpitError(f"небезопасный путь в Modal volume: {path!r}")
+        if any(part in ("", ".", "..") for part in path.split("/")):
+            raise CockpitError(f"небезопасный или неканонический путь в Modal volume: {path!r}")
+
+    @staticmethod
+    def _filesystem_collision_flags(root: Path) -> tuple[bool, bool]:
+        case_probe = root / f".mc-case-{secrets.token_hex(4)}"
+        unicode_probe = root / f".mc-unicode-e\u0301-{secrets.token_hex(4)}"
+        try:
+            case_probe.touch()
+            unicode_probe.touch()
+            case_insensitive = (root / case_probe.name.upper()).exists()
+            unicode_normalizing = (root / unicodedata.normalize("NFC", unicode_probe.name)).exists()
+            return case_insensitive, unicode_normalizing
+        finally:
+            case_probe.unlink(missing_ok=True)
+            unicode_probe.unlink(missing_ok=True)
+
+    def inventory_volume(
+        self,
+        alias: str,
+        volume: str,
+        *,
+        environment: str | None = None,
+        collision_root: Path,
+    ) -> dict[str, tuple[str, int]]:
+        entries: dict[str, tuple[str, int]] = {}
+        collision_seen: dict[str, str] = {}
+        case_insensitive, unicode_normalizing = self._filesystem_collision_flags(collision_root)
+
+        def collision_key(path: str) -> str:
+            key = unicodedata.normalize("NFC", path) if unicode_normalizing else path
+            return key.casefold() if case_insensitive else key
+
+        queue = ["/"]
+        visited_dirs: set[str] = set()
+        while queue:
+            rows = self.list_volume_entries(alias, volume, path=queue.pop(0), environment=environment)
+            for row in rows:
+                path = self._decode_modal_ls_path(row["filename"])
+                self._validate_remote_volume_path(path)
+                entry_type = row["type"]
+                if entry_type not in ("file", "dir"):
+                    raise CockpitError(
+                        f"volume {volume!r} содержит unsupported entry {path!r} типа {entry_type!r}; "
+                        "переносятся только regular files и directories"
+                    )
+                key = collision_key(path)
+                if key in collision_seen:
+                    raise CockpitError(
+                        f"volume {volume!r} содержит имена {collision_seen[key]!r} и {path!r}, "
+                        "которые конфликтуют на локальной файловой системе"
+                    )
+                collision_seen[key] = path
+                size = row.get("size")
+                entries[path] = (entry_type, size if isinstance(size, int) and size >= 0 else 0)
+                if entry_type == "dir" and path not in visited_dirs:
+                    visited_dirs.add(path)
+                    queue.append(path)
+        return entries
+
+    @staticmethod
+    def _staging_file_sizes(staging: Path) -> dict[str, int]:
+        result: dict[str, int] = {}
+        for root, _dirs, files in os.walk(staging):
+            for name in files:
+                path = Path(root) / name
+                if path.is_file() and not path.is_symlink():
+                    result[path.relative_to(staging).as_posix()] = path.stat().st_size
+        return result
+
+    @staticmethod
+    def _validate_downloaded_inventory(
+        inventory: dict[str, tuple[str, int]],
+        staging: Path,
+        *,
+        volume: str,
+    ) -> None:
+        remote_files = {path: size for path, (entry_type, size) in inventory.items() if entry_type == "file"}
+        local_files = ModalCockpit._staging_file_sizes(staging)
+        missing = sorted(set(remote_files) - set(local_files))
+        unexpected = sorted(set(local_files) - set(remote_files))
+        if missing or unexpected:
+            details = []
+            if missing:
+                details.append("не скачаны: " + ", ".join(missing[:5]))
+            if unexpected:
+                details.append("лишние локальные файлы: " + ", ".join(unexpected[:5]))
+            raise CockpitError(f"download volume {volume!r} incomplete или несогласован: " + "; ".join(details))
+        mismatched = sorted(path for path, size in remote_files.items() if local_files[path] != size)
+        if mismatched:
+            raise CockpitError(
+                f"download volume {volume!r} incomplete: размеры не совпадают у " + ", ".join(mismatched[:5])
+            )
+
+    @staticmethod
+    def validate_destination_volume_name(volume: str) -> str:
+        volume = validate_name(volume, label="имя destination Modal volume")
+        if len(volume) > 64 or re.fullmatch(r"[A-Za-z0-9_.-]+", volume) is None or re.fullmatch(r"ap-[A-Za-z0-9]{22}", volume):
+            raise CockpitError(
+                f"некорректное имя destination Modal volume {volume!r}: используйте до 64 символов "
+                "латиницы/цифр и '-_.'; имена формата App ID запрещены"
+            )
+        return volume
+
     def _run_modal(
         self,
         alias: str,
@@ -431,6 +556,8 @@ class ModalCockpit:
                     check=False,
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                 )
             else:
                 completed = subprocess.run(command, env=env, check=False, stdout=2)
@@ -456,8 +583,10 @@ class ModalCockpit:
             ["volume", "list", "--json", *self._environment_args(environment)],
             capture_output=True,
         )
+        if not (completed.stdout or "").strip():
+            raise ExternalCommandError("modal volume list вернул пустой stdout")
         try:
-            rows = json.loads(completed.stdout or "[]")
+            rows = json.loads(completed.stdout)
         except json.JSONDecodeError as exc:
             raise ExternalCommandError("modal volume list вернул некорректный JSON") from exc
         if not isinstance(rows, list):
@@ -483,8 +612,10 @@ class ModalCockpit:
             ["volume", "ls", "--json", *self._environment_args(environment), volume, path],
             capture_output=True,
         )
+        if not (completed.stdout or "").strip():
+            raise ExternalCommandError("modal volume ls вернул пустой stdout")
         try:
-            rows = json.loads(completed.stdout or "[]")
+            rows = json.loads(completed.stdout)
         except json.JSONDecodeError as exc:
             raise ExternalCommandError("modal volume ls вернул некорректный JSON") from exc
         if not isinstance(rows, list):
@@ -580,6 +711,33 @@ class ModalCockpit:
         destination_environment: str | None = None,
         verify: bool = False,
     ) -> dict[str, Any]:
+        transfer_lock = self.store.root / "modal-cockpit-transfer.lock"
+        with exclusive_lock(transfer_lock):
+            return self._transfer_volume_unlocked(
+                source_alias,
+                destination_alias,
+                volume,
+                destination_volume=destination_volume,
+                force=force,
+                staging_parent=staging_parent,
+                source_environment=source_environment,
+                destination_environment=destination_environment,
+                verify=verify,
+            )
+
+    def _transfer_volume_unlocked(
+        self,
+        source_alias: str,
+        destination_alias: str,
+        volume: str,
+        *,
+        destination_volume: str | None = None,
+        force: bool = False,
+        staging_parent: Path | None = None,
+        source_environment: str | None = None,
+        destination_environment: str | None = None,
+        verify: bool = False,
+    ) -> dict[str, Any]:
         """Copy a whole Modal volume through local temporary staging.
 
         This is a copy-first operation: the source volume is never deleted or mutated.
@@ -590,7 +748,8 @@ class ModalCockpit:
         source_alias = validate_name(source_alias, label="исходный аккаунт")
         destination_alias = validate_name(destination_alias, label="целевой аккаунт")
         volume = validate_name(volume, label="исходный volume")
-        destination_volume = validate_name(destination_volume or volume, label="целевой volume")
+        destination_volume = volume if destination_volume is None else validate_name(destination_volume, label="целевой volume")
+        self.validate_destination_volume_name(destination_volume)
         if source_alias == destination_alias:
             raise CockpitError("transfer предназначен для копирования между разными аккаунтами")
         if volume.startswith("-") or destination_volume.startswith("-"):
@@ -612,10 +771,21 @@ class ModalCockpit:
             ensure_private_dir(parent)
         else:
             parent = staging_parent.expanduser()
-            parent.mkdir(parents=True, exist_ok=True)
+            try:
+                parent.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise CockpitError(f"не удалось подготовить staging directory {parent}: {exc}") from exc
+            if not parent.is_dir():
+                raise CockpitError(f"staging parent не является директорией: {parent}")
 
         with tempfile.TemporaryDirectory(prefix="volume-transfer-", dir=parent) as temp_dir:
             staging = Path(temp_dir)
+            inventory = self.inventory_volume(
+                source_alias,
+                volume,
+                environment=source_environment,
+                collision_root=staging,
+            )
             self._run_modal(
                 source_alias,
                 [
@@ -627,6 +797,7 @@ class ModalCockpit:
                     str(staging),
                 ],
             )
+            self._validate_downloaded_inventory(inventory, staging, volume=volume)
             files, byte_count, directories = self._inspect_staging_tree(staging)
             source_manifest = self._file_manifest(staging, files)
             if destination_volume not in destination_names:
@@ -650,6 +821,12 @@ class ModalCockpit:
         if verify and files:
             with tempfile.TemporaryDirectory(prefix="volume-verify-", dir=parent) as verify_dir:
                 verify_staging = Path(verify_dir)
+                self.inventory_volume(
+                    destination_alias,
+                    destination_volume,
+                    environment=destination_environment,
+                    collision_root=verify_staging,
+                )
                 self._run_modal(
                     destination_alias,
                     [
@@ -700,6 +877,31 @@ class ModalCockpit:
         destination_environment: str | None = None,
         verify: bool = False,
     ) -> list[dict[str, Any]]:
+        transfer_lock = self.store.root / "modal-cockpit-transfer.lock"
+        with exclusive_lock(transfer_lock):
+            return self._transfer_volumes_locked(
+                source_alias,
+                destination_alias,
+                volumes=volumes,
+                force=force,
+                staging_parent=staging_parent,
+                source_environment=source_environment,
+                destination_environment=destination_environment,
+                verify=verify,
+            )
+
+    def _transfer_volumes_locked(
+        self,
+        source_alias: str,
+        destination_alias: str,
+        *,
+        volumes: Sequence[str] | None = None,
+        force: bool = False,
+        staging_parent: Path | None = None,
+        source_environment: str | None = None,
+        destination_environment: str | None = None,
+        verify: bool = False,
+    ) -> list[dict[str, Any]]:
         if volumes is None:
             names = self.list_volume_names(source_alias, environment=source_environment)
         else:
@@ -722,7 +924,7 @@ class ModalCockpit:
         for volume in names:
             try:
                 results.append(
-                    self.transfer_volume(
+                    self._transfer_volume_unlocked(
                         source_alias,
                         destination_alias,
                         volume,
@@ -915,4 +1117,10 @@ class ModalCockpit:
             )
         else:
             add("ok", "env-overrides", "credential env overrides не установлены")
+
+        transport_env = [name for name in TRANSPORT_ENV_VARS if os.environ.get(name)]
+        if transport_env:
+            add("warn", "env-transport", "установлены transport env overrides: " + ", ".join(transport_env))
+        else:
+            add("ok", "env-transport", "transport env overrides не установлены")
         return checks

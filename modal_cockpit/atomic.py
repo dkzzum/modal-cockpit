@@ -74,23 +74,24 @@ def exclusive_lock(lock_path: Path, *, timeout_seconds: float = 10.0) -> Iterato
     """
 
     lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if fcntl is None:
+        raise StoreError("fcntl недоступен: modal-cockpit поддерживает только POSIX-системы")
     handle = lock_path.open("a+b")
     locked = False
     try:
-        if fcntl is not None:
-            deadline = time.monotonic() + timeout_seconds
-            while True:
-                try:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    locked = True
-                    break
-                except BlockingIOError:
-                    if time.monotonic() >= deadline:
-                        raise StoreError(
-                            f"другой процесс modal-cockpit удерживает lock {lock_path} "
-                            f"дольше {timeout_seconds:.0f} секунд"
-                        )
-                    time.sleep(0.025)
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise StoreError(
+                        f"другой процесс modal-cockpit удерживает lock {lock_path} "
+                        f"дольше {timeout_seconds:.0f} секунд"
+                    )
+                time.sleep(0.025)
         yield
     finally:
         if locked and fcntl is not None:

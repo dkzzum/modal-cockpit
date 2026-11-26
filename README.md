@@ -104,8 +104,9 @@ modal-cockpit add work
 Or through stdin without putting secret literals into shell arguments:
 
 ```bash
-printf '%s\n%s\n' "$MODAL_TOKEN_ID" "$MODAL_TOKEN_SECRET" \
+printf '%s\n%s\n' "$TOKEN_ID" "$TOKEN_SECRET" \
   | modal-cockpit add work --token-id - --token-secret -
+unset TOKEN_ID TOKEN_SECRET
 ```
 
 Passing secrets directly as `--token-id/--token-secret` arguments is supported but discouraged because they may appear in shell history or process listings.
@@ -198,12 +199,16 @@ Important behavior and limitations:
 - without `--force`, a non-empty destination volume aborts during preflight before any download; `--force` means merge/overwrite, not mirror — extra destination files remain;
 - all data is temporarily written to local disk, so enough free space is required. Use `--staging-dir` to choose a larger disk;
 - temporary data is deleted after a normal exit, but it is plaintext while the transfer is running and can remain after SIGKILL/power loss;
-- only regular files are transferred. Modal CLI may omit symlinks or special entries before they ever reach local staging; any symlink or special file that is detected in staging aborts the transfer before upload. Empty directories, timestamps and executable bits are not guaranteed to be preserved;
-- copying a live volume is not snapshot-consistent; stop writers first. A failed upload can leave a partial destination volume;
+- before download the source volume is recursively inventoried. Symlinks, FIFOs, sockets, absolute/`..` path components and filename collisions on the local filesystem abort the transfer before download. After download, missing files and size mismatches are checked before any destination upload. Empty directories, timestamps and executable bits are not guaranteed to be preserved;
+- copying a live volume is not snapshot-consistent; stop writers first. Inventory reduces silent-omission and unsafe-path risk but cannot eliminate races with concurrent writers. A failed upload can leave a partial destination volume;
 - `--verify` re-downloads the destination and compares SHA-256 for copied files. It validates the upload side, but cannot independently prove that Modal's original source download was correct; it increases bandwidth/time and does not roll back a failed copy;
 - transfer cannot bypass Modal billing or access restrictions: the source account must still be able to read the volume;
 - volume metadata/backend version is not copied; auto-created volumes use Modal defaults. Tested against Modal CLI 1.6.4;
 - legacy `modal.NetworkFileSystem` objects are not supported by this command.
+
+## Platform support
+
+`modal-cockpit` currently supports POSIX systems (Linux and macOS). On non-POSIX platforms it fails closed rather than silently disabling file locking and permission checks. On macOS Intel, installing the pinned `cryptography` dependency may require a Rust/native build toolchain because current upstream wheels are Apple-Silicon-only.
 
 ## Backups and recovery
 
